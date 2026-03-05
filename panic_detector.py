@@ -9,13 +9,13 @@ def check_market():
     vix = yf.Ticker("^VIX")
     vix_price = vix.history(period="1d")["Close"].iloc[-1]
 
-sp = yf.Ticker("^GSPC")
-sp_data = sp.history(period="1y")
+    sp = yf.Ticker("^GSPC")
+    sp_data = sp.history(period="1y")
 
-current = sp_data["Close"].iloc[-1]
-peak = sp_data["Close"].max()
+    current = sp_data["Close"].iloc[-1]
+    peak = sp_data["Close"].max()
 
-drawdown = (current - peak) / peak * 100
+    drawdown = (current - peak) / peak * 100
 
     url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
     data = requests.get(url).json()
