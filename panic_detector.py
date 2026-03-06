@@ -5,8 +5,26 @@ import yfinance as yf
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-ALERT_COOLDOWN_SECONDS = 6 * 60 * 60
-last_alert_time = 0
+
+CHECK_INTERVAL_SECONDS = 3600  # 1 hour
+PANIC_ALERT_COOLDOWN_SECONDS = 6 * 60 * 60  # 6 hours
+
+WATCHLIST = [
+    "NVDA",
+    "META",
+    "GOOGL",
+    "MSFT",
+    "AVGO",
+    "AMD",
+    "TSM",
+    "SOFI",
+    "INTC",
+    "VOO",
+    "VTI",
+    "VXUS",
+]
+
+last_panic_alert_time = 0
 
 
 def send_telegram_message(text):
@@ -23,10 +41,11 @@ def send_telegram_message(text):
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": text,
             },
-            timeout=10,
+            timeout=15,
         )
+        print("Telegram status:", r.status_code)
+        print("Telegram response:", r.text)
         r.raise_for_status()
-        print("Telegram message sent")
         return True
     except Exception as e:
         print("Telegram send error:", e)
@@ -50,48 +69,103 @@ def get_fear_greed():
         return None
 
 
+def get_market_data():
+    vix = yf.Ticker("^VIX")
+    vix_hist = vix.history(period="5d", interval="1d")
+    if vix_hist.empty or vix_hist["Close"].dropna().empty:
+        raise ValueError("No VIX data returned")
+    vix_price = float(vix_hist["Close"].dropna().iloc[-1])
+
+    sp = yf.Ticker("^GSPC")
+    sp_data = sp.history(period="1y", interval="1d")
+    if sp_data.empty or sp_data["Close"].dropna().empty:
+        raise ValueError("No S&P 500 data returned")
+
+    current = float(sp_data["Close"].dropna().iloc[-1])
+    peak = float(sp_data["Close"].max())
+    drawdown = (current - peak) / peak * 100
+
+    fear_greed = get_fear_greed()
+
+    return vix_price, fear_greed, drawdown, current, peak
+
+
+def get_watchlist_update():
+    lines = ["📈 Watchlist Update"]
+
+    for ticker in WATCHLIST:
+        try:
+            stock = yf.Ticker(ticker)
+            hist = stock.history(period="5d", interval="1d")
+
+            if hist.empty or len(hist["Close"].dropna()) == 0:
+                lines.append(f"{ticker}: no data")
+                continue
+
+            closes = hist["Close"].dropna()
+            latest = float(closes.iloc[-1])
+
+            if len(closes) >= 2:
+                prev = float(closes.iloc[-2])
+                pct_change = ((latest - prev) / prev) * 100
+                lines.append(f"{ticker}: {latest:.2f} ({pct_change:+.2f}%)")
+            else:
+                lines.append(f"{ticker}: {latest:.2f}")
+
+        except Exception as e:
+            print(f"Watchlist error for {ticker}: {e}")
+            lines.append(f"{ticker}: error")
+
+    return "\n".join(lines)
+
+
 def check_market():
-    global last_alert_time
+    global last_panic_alert_time
 
     print("Checking markets...")
 
     try:
-        vix = yf.Ticker("^VIX")
-        vix_hist = vix.history(period="5d", interval="1d")
-        if vix_hist.empty:
-            raise ValueError("No VIX data returned")
-        vix_price = float(vix_hist["Close"].dropna().iloc[-1])
-
-        sp = yf.Ticker("^GSPC")
-        sp_data = sp.history(period="1y", interval="1d")
-        if sp_data.empty:
-            raise ValueError("No S&P 500 data returned")
-
-        current = float(sp_data["Close"].dropna().iloc[-1])
-        peak = float(sp_data["Close"].max())
-        drawdown = (current - peak) / peak * 100
-
-        fear_greed = get_fear_greed()
+        vix_price, fear_greed, drawdown, current, peak = get_market_data()
 
         print("VIX:", vix_price)
         print("Fear & Greed:", fear_greed)
         print("Drawdown:", drawdown)
 
-        if fear_greed is not None:
-            if vix_price > 30 and fear_greed < 20 and drawdown < -20:
-                now = time.time()
+        market_status = (
+            "📊 Market Status\n"
+            f"VIX: {vix_price:.2f}\n"
+            f"Fear & Greed: {fear_greed if fear_greed is not None else 'N/A'}\n"
+            f"S&P 500: {current:.2f}\n"
+            f"1Y Peak: {peak:.2f}\n"
+            f"Drawdown: {drawdown:.2f}%"
+        )
 
-                if now - last_alert_time > ALERT_COOLDOWN_SECONDS:
-                    msg = (
-                        "🚨 PANIC BUY SIGNAL 🚨\n"
-                        f"VIX: {vix_price:.2f}\n"
-                        f"Fear & Greed: {fear_greed}\n"
-                        f"Drawdown: {drawdown:.2f}%"
-                    )
-                    if send_telegram_message(msg):
-                        last_alert_time = now
-                else:
-                    print("Signal triggered but cooldown active.")
+        watchlist_status = get_watchlist_update()
+
+        send_telegram_message(f"{market_status}\n\n{watchlist_status}")
+
+        panic_signal = (
+            fear_greed is not None
+            and vix_price > 30
+            and fear_greed < 20
+            and drawdown < -20
+        )
+
+        if panic_signal:
+            now = time.time()
+
+            if now - last_panic_alert_time > PANIC_ALERT_COOLDOWN_SECONDS:
+                panic_message = (
+                    "🚨 PANIC BUY SIGNAL 🚨\n"
+                    f"VIX: {vix_price:.2f}\n"
+                    f"Fear & Greed: {fear_greed}\n"
+                    f"S&P 500: {current:.2f}\n"
+                    f"Drawdown: {drawdown:.2f}%"
+                )
+                if send_telegram_message(panic_message):
+                    last_panic_alert_time = now
+            else:
+                print("Panic signal triggered, but cooldown active.")
 
     except Exception as e:
         print("Market check error:", e)
@@ -99,9 +173,10 @@ def check_market():
 
 
 if __name__ == "__main__":
-    send_telegram_message("✅ Panic detector started on Railway")
+    send_telegram_message("✅ Watchlist + panic detector started on Railway")
+    check_market()
 
     while True:
+        print(f"Sleeping {CHECK_INTERVAL_SECONDS} seconds...")
+        time.sleep(CHECK_INTERVAL_SECONDS)
         check_market()
-        print("Sleeping 1 hour...")
-        time.sleep(3600)
