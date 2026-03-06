@@ -7,14 +7,19 @@ def get_fear_greed():
 
     url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, headers=headers, timeout=10)
 
         if response.status_code != 200:
-            print("Fear & Greed API failed")
+            print("Fear & Greed API failed:", response.status_code)
             return None
 
         data = response.json()
+
         return data["fear_and_greed"]["score"]
 
     except Exception as e:
