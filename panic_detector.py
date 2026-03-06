@@ -12,11 +12,42 @@ TELEGRAM_POLL_SECONDS = 20
 PANIC_ALERT_COOLDOWN_SECONDS = 6 * 60 * 60
 
 WATCHLIST = [
-    "VXUS",
+    "NVDA",
+    "META",
+    "GOOGL",
+    "MSFT",
+    "AVGO",
+    "AMD",
+    "TSM",
+    "SOFI",
     "INTC",
+    "VOO",
+    "VTI",
+    "VXUS",
     "BTC-USD",
+    "YM=F",   # Dow futures
+    "NQ=F",   # Nasdaq futures
     "ES=F",   # S&P 500 futures
 ]
+
+LABEL_MAP = {
+    "NVDA": "NVDA",
+    "META": "META",
+    "GOOGL": "GOOGL",
+    "MSFT": "MSFT",
+    "AVGO": "AVGO",
+    "AMD": "AMD",
+    "TSM": "TSM",
+    "SOFI": "SOFI",
+    "INTC": "INTC",
+    "VOO": "VOO",
+    "VTI": "VTI",
+    "VXUS": "VXUS",
+    "BTC-USD": "Bitcoin",
+    "YM=F": "Dow Futures",
+    "NQ=F": "Nasdaq Futures",
+    "ES=F": "S&P Futures",
+}
 
 last_panic_alert_time = 0
 last_update_id = None
@@ -54,6 +85,7 @@ def send_telegram_message(text):
 def get_telegram_updates(offset=None, timeout=15):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     params = {"timeout": timeout}
+
     if offset is not None:
         params["offset"] = offset
 
@@ -68,10 +100,6 @@ def get_telegram_updates(offset=None, timeout=15):
 
 
 def get_cnn_fear_greed():
-    """
-    Uses the unofficial 'fear-and-greed' package, which scrapes CNN's Fear & Greed page.
-    Returns dict with value, description, last_update.
-    """
     try:
         fg = fear_and_greed.get()
         return {
@@ -105,7 +133,6 @@ def get_last_price_and_change(ticker):
 
 def get_market_data():
     vix_price, vix_change = get_last_price_and_change("^VIX")
-    sp_price, _ = get_last_price_and_change("^GSPC")
 
     sp = yf.Ticker("^GSPC")
     sp_hist = sp.history(period="1y", interval="1d")
@@ -121,7 +148,6 @@ def get_market_data():
     return {
         "vix_price": vix_price,
         "vix_change": vix_change,
-        "sp_price": sp_price,
         "sp_current": sp_current,
         "sp_peak": sp_peak,
         "drawdown": drawdown,
@@ -132,21 +158,15 @@ def get_market_data():
 def format_watchlist_status():
     lines = ["📈 Watchlist"]
 
-    label_map = {
-        "VXUS": "VXUS",
-        "INTC": "INTC",
-        "BTC-USD": "Bitcoin",
-        "ES=F": "S&P Futures",
-    }
-
     for ticker in WATCHLIST:
+        label = LABEL_MAP.get(ticker, ticker)
+
         try:
             price, pct = get_last_price_and_change(ticker)
-            label = label_map.get(ticker, ticker)
             lines.append(f"{label}: {price:.2f} ({pct:+.2f}%)")
         except Exception as e:
             print(f"Watchlist error for {ticker}: {e}")
-            lines.append(f"{label_map.get(ticker, ticker)}: error")
+            lines.append(f"{label}: error")
 
     return "\n".join(lines)
 
@@ -312,7 +332,7 @@ def main():
 
     send_telegram_message(
         "✅ Bot started on Railway\n"
-        "Using CNN stock Fear & Greed + watchlist"
+        "Using CNN Fear & Greed + full watchlist"
     )
 
     try:
