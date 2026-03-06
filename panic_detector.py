@@ -5,22 +5,15 @@ import time
 
 def get_fear_greed():
 
-    url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
-
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+    url = "https://api.alternative.me/fng/?limit=1"
 
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-
-        if response.status_code != 200:
-            print("Fear & Greed API failed:", response.status_code)
-            return None
-
+        response = requests.get(url, timeout=10)
         data = response.json()
 
-        return data["fear_and_greed"]["score"]
+        score = int(data["data"][0]["value"])
+
+        return score
 
     except Exception as e:
         print("Fear & Greed fetch error:", e)
