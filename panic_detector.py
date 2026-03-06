@@ -2,28 +2,20 @@ import os
 import time
 import requests
 import yfinance as yf
+import fear_and_greed
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-CHECK_INTERVAL_SECONDS = 3600          # automatic market check every hour
-TELEGRAM_POLL_SECONDS = 20             # bot checks for new Telegram commands every 20 sec
+CHECK_INTERVAL_SECONDS = 3600
+TELEGRAM_POLL_SECONDS = 20
 PANIC_ALERT_COOLDOWN_SECONDS = 6 * 60 * 60
 
 WATCHLIST = [
-    "NVDA",
-    "META",
-    "GOOGL",
-    "MSFT",
-    "AVGO",
-    "AMD",
-    "TSM",
-    "SOFI",
-    "INTC",
-    "VOO",
-    "VTI",
     "VXUS",
     "INTC",
+    "BTC-USD",
+    "ES=F",   # S&P 500 futures
 ]
 
 last_panic_alert_time = 0
@@ -61,9 +53,7 @@ def send_telegram_message(text):
 
 def get_telegram_updates(offset=None, timeout=15):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {
-        "timeout": timeout,
-    }
+    params = {"timeout": timeout}
     if offset is not None:
         params["offset"] = offset
 
@@ -77,150 +67,155 @@ def get_telegram_updates(offset=None, timeout=15):
         return []
 
 
-def get_fear_greed():
-    url = "https://api.alternative.me/fng/?limit=1"
-
+def get_cnn_fear_greed():
+    """
+    Uses the unofficial 'fear-and-greed' package, which scrapes CNN's Fear & Greed page.
+    Returns dict with value, description, last_update.
+    """
     try:
-        response = requests.get(
-            url,
-            timeout=10,
-            headers={"User-Agent": "Mozilla/5.0 panic-detector/1.0"},
-        )
-        response.raise_for_status()
-        data = response.json()
-        return int(data["data"][0]["value"])
+        fg = fear_and_greed.get()
+        return {
+            "value": float(fg.value),
+            "description": str(fg.description),
+            "last_update": str(fg.last_update),
+        }
     except Exception as e:
-        print("Fear & Greed fetch error:", e)
+        print("CNN Fear & Greed fetch error:", e)
         return None
 
 
+def get_last_price_and_change(ticker):
+    stock = yf.Ticker(ticker)
+    hist = stock.history(period="5d", interval="1d")
+
+    if hist.empty or hist["Close"].dropna().empty:
+        raise ValueError(f"No data returned for {ticker}")
+
+    closes = hist["Close"].dropna()
+    latest = float(closes.iloc[-1])
+
+    if len(closes) >= 2:
+        prev = float(closes.iloc[-2])
+        pct_change = ((latest - prev) / prev) * 100
+    else:
+        pct_change = 0.0
+
+    return latest, pct_change
+
+
 def get_market_data():
-    vix = yf.Ticker("^VIX")
-    vix_hist = vix.history(period="5d", interval="1d")
-    if vix_hist.empty or vix_hist["Close"].dropna().empty:
-        raise ValueError("No VIX data returned")
-    vix_price = float(vix_hist["Close"].dropna().iloc[-1])
+    vix_price, vix_change = get_last_price_and_change("^VIX")
+    sp_price, _ = get_last_price_and_change("^GSPC")
 
     sp = yf.Ticker("^GSPC")
-    sp_data = sp.history(period="1y", interval="1d")
-    if sp_data.empty or sp_data["Close"].dropna().empty:
-        raise ValueError("No S&P 500 data returned")
+    sp_hist = sp.history(period="1y", interval="1d")
+    if sp_hist.empty or sp_hist["Close"].dropna().empty:
+        raise ValueError("No S&P 500 history returned")
 
-    current = float(sp_data["Close"].dropna().iloc[-1])
-    peak = float(sp_data["Close"].max())
-    drawdown = (current - peak) / peak * 100
+    sp_current = float(sp_hist["Close"].dropna().iloc[-1])
+    sp_peak = float(sp_hist["Close"].max())
+    drawdown = (sp_current - sp_peak) / sp_peak * 100
 
-    fear_greed = get_fear_greed()
+    cnn_fg = get_cnn_fear_greed()
 
     return {
         "vix_price": vix_price,
-        "fear_greed": fear_greed,
-        "sp_current": current,
-        "sp_peak": peak,
+        "vix_change": vix_change,
+        "sp_price": sp_price,
+        "sp_current": sp_current,
+        "sp_peak": sp_peak,
         "drawdown": drawdown,
+        "cnn_fg": cnn_fg,
     }
 
 
-def get_watchlist_data():
-    rows = []
+def format_watchlist_status():
+    lines = ["📈 Watchlist"]
+
+    label_map = {
+        "VXUS": "VXUS",
+        "INTC": "INTC",
+        "BTC-USD": "Bitcoin",
+        "ES=F": "S&P Futures",
+    }
 
     for ticker in WATCHLIST:
         try:
-            stock = yf.Ticker(ticker)
-            hist = stock.history(period="5d", interval="1d")
-
-            if hist.empty or hist["Close"].dropna().empty:
-                rows.append(f"{ticker}: no data")
-                continue
-
-            closes = hist["Close"].dropna()
-            latest = float(closes.iloc[-1])
-
-            if len(closes) >= 2:
-                prev = float(closes.iloc[-2])
-                pct_change = ((latest - prev) / prev) * 100
-                rows.append(f"{ticker}: {latest:.2f} ({pct_change:+.2f}%)")
-            else:
-                rows.append(f"{ticker}: {latest:.2f}")
-
+            price, pct = get_last_price_and_change(ticker)
+            label = label_map.get(ticker, ticker)
+            lines.append(f"{label}: {price:.2f} ({pct:+.2f}%)")
         except Exception as e:
             print(f"Watchlist error for {ticker}: {e}")
-            rows.append(f"{ticker}: error")
+            lines.append(f"{label_map.get(ticker, ticker)}: error")
 
-    return rows
+    return "\n".join(lines)
 
 
 def format_market_status():
     data = get_market_data()
-    fear_greed_display = data["fear_greed"] if data["fear_greed"] is not None else "N/A"
+
+    if data["cnn_fg"] is not None:
+        fg_value = round(data["cnn_fg"]["value"])
+        fg_desc = data["cnn_fg"]["description"]
+    else:
+        fg_value = "N/A"
+        fg_desc = "unavailable"
 
     return (
         "📊 Market Status\n"
-        f"VIX: {data['vix_price']:.2f}\n"
-        f"Fear & Greed: {fear_greed_display}\n"
+        f"VIX: {data['vix_price']:.2f} ({data['vix_change']:+.2f}%)\n"
+        f"CNN Fear & Greed: {fg_value} ({fg_desc})\n"
         f"S&P 500: {data['sp_current']:.2f}\n"
         f"1Y Peak: {data['sp_peak']:.2f}\n"
         f"Drawdown: {data['drawdown']:.2f}%"
     )
 
 
-def format_watchlist_status():
-    rows = get_watchlist_data()
-    return "📈 Watchlist\n" + "\n".join(rows)
+def panic_signal_triggered(data):
+    fg_value = None if data["cnn_fg"] is None else data["cnn_fg"]["value"]
 
-
-def panic_signal_triggered(market_data):
     return (
-        market_data["fear_greed"] is not None
-        and market_data["vix_price"] > 30
-        and market_data["fear_greed"] < 20
-        and market_data["drawdown"] < -20
+        fg_value is not None
+        and data["vix_price"] > 30
+        and fg_value < 25
+        and data["drawdown"] < -10
     )
 
 
 def run_panic_check(send_normal_status=False):
     global last_panic_alert_time
 
-    print("Running panic check...")
+    data = get_market_data()
 
-    market_data = get_market_data()
-
-    print("VIX:", market_data["vix_price"])
-    print("Fear & Greed:", market_data["fear_greed"])
-    print("Drawdown:", market_data["drawdown"])
+    print("VIX:", data["vix_price"])
+    print("CNN Fear & Greed:", data["cnn_fg"])
+    print("Drawdown:", data["drawdown"])
 
     if send_normal_status:
-        fear_greed_display = (
-            market_data["fear_greed"]
-            if market_data["fear_greed"] is not None
-            else "N/A"
-        )
-        send_telegram_message(
-            "📊 Scheduled Market Check\n"
-            f"VIX: {market_data['vix_price']:.2f}\n"
-            f"Fear & Greed: {fear_greed_display}\n"
-            f"S&P 500: {market_data['sp_current']:.2f}\n"
-            f"1Y Peak: {market_data['sp_peak']:.2f}\n"
-            f"Drawdown: {market_data['drawdown']:.2f}%"
-        )
+        msg = f"{format_market_status()}\n\n{format_watchlist_status()}"
+        send_telegram_message(msg)
 
-    if panic_signal_triggered(market_data):
+    if panic_signal_triggered(data):
         now = time.time()
 
         if now - last_panic_alert_time > PANIC_ALERT_COOLDOWN_SECONDS:
-            msg = (
-                "🚨 PANIC BUY SIGNAL 🚨\n"
-                f"VIX: {market_data['vix_price']:.2f}\n"
-                f"Fear & Greed: {market_data['fear_greed']}\n"
-                f"S&P 500: {market_data['sp_current']:.2f}\n"
-                f"Drawdown: {market_data['drawdown']:.2f}%"
+            fg_value = round(data["cnn_fg"]["value"]) if data["cnn_fg"] else "N/A"
+            fg_desc = data["cnn_fg"]["description"] if data["cnn_fg"] else "unavailable"
+
+            panic_msg = (
+                "🚨 STOCK PANIC ALERT 🚨\n"
+                f"VIX: {data['vix_price']:.2f}\n"
+                f"CNN Fear & Greed: {fg_value} ({fg_desc})\n"
+                f"S&P 500 Drawdown: {data['drawdown']:.2f}%\n\n"
+                f"{format_watchlist_status()}"
             )
-            if send_telegram_message(msg):
+
+            if send_telegram_message(panic_msg):
                 last_panic_alert_time = now
         else:
             print("Panic signal triggered, but cooldown active.")
 
-    return market_data
+    return data
 
 
 def handle_command(text):
@@ -228,7 +223,7 @@ def handle_command(text):
 
     if cmd == "/start":
         send_telegram_message(
-            "✅ Brian Panic Detector is live.\n\n"
+            "✅ Brian Stock Bot is live.\n\n"
             "Commands:\n"
             "/status - market + watchlist\n"
             "/watchlist - watchlist only\n"
@@ -247,9 +242,7 @@ def handle_command(text):
 
     elif cmd == "/status":
         try:
-            market = format_market_status()
-            watchlist = format_watchlist_status()
-            send_telegram_message(f"{market}\n\n{watchlist}")
+            send_telegram_message(f"{format_market_status()}\n\n{format_watchlist_status()}")
         except Exception as e:
             print("Status command error:", e)
             send_telegram_message(f"⚠️ /status failed: {e}")
@@ -263,19 +256,16 @@ def handle_command(text):
 
     elif cmd == "/panic":
         try:
-            market_data = run_panic_check(send_normal_status=False)
-            fear_greed_display = (
-                market_data["fear_greed"]
-                if market_data["fear_greed"] is not None
-                else "N/A"
-            )
-            triggered = panic_signal_triggered(market_data)
+            data = run_panic_check(send_normal_status=False)
+            fg_value = round(data["cnn_fg"]["value"]) if data["cnn_fg"] else "N/A"
+            fg_desc = data["cnn_fg"]["description"] if data["cnn_fg"] else "unavailable"
+            triggered = panic_signal_triggered(data)
 
             send_telegram_message(
                 "🧪 Panic Check Complete\n"
-                f"VIX: {market_data['vix_price']:.2f}\n"
-                f"Fear & Greed: {fear_greed_display}\n"
-                f"Drawdown: {market_data['drawdown']:.2f}%\n"
+                f"VIX: {data['vix_price']:.2f}\n"
+                f"CNN Fear & Greed: {fg_value} ({fg_desc})\n"
+                f"Drawdown: {data['drawdown']:.2f}%\n"
                 f"Signal: {'ON' if triggered else 'OFF'}"
             )
         except Exception as e:
@@ -283,9 +273,7 @@ def handle_command(text):
             send_telegram_message(f"⚠️ /panic failed: {e}")
 
     else:
-        send_telegram_message(
-            "Unknown command.\nUse /help to see available commands."
-        )
+        send_telegram_message("Unknown command.\nUse /help to see available commands.")
 
 
 def process_telegram_updates():
@@ -324,7 +312,7 @@ def main():
 
     send_telegram_message(
         "✅ Bot started on Railway\n"
-        "Use /status, /watchlist, /panic, or /help"
+        "Using CNN stock Fear & Greed + watchlist"
     )
 
     try:
