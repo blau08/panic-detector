@@ -112,8 +112,8 @@ def get_telegram_updates(offset=None, timeout=15):
         return []
 
 
-def get_cnn_fear_greed():
-    # Primary: older CNN-style endpoint
+def get_fear_greed():
+    # Try old CNN endpoint first
     cnn_url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 
     try:
@@ -142,14 +142,14 @@ def get_cnn_fear_greed():
         if score is not None:
             return {
                 "value": float(score),
-                "description": str(rating),
-                "source": "cnn"
+                "description": str(rating).lower(),
+                "source": "cnn",
             }
 
     except Exception as e:
         print("CNN Fear & Greed primary fetch failed:", e)
 
-    # Fallback: Finhacker mirror
+    # Finhacker fallback
     fallback_url = "https://www.finhacker.cz/en/fear-and-greed-index-historical-data-and-chart/"
 
     try:
@@ -159,30 +159,23 @@ def get_cnn_fear_greed():
             headers={"User-Agent": "Mozilla/5.0"}
         )
         r.raise_for_status()
-        html = r.text
+        text = re.sub(r"\s+", " ", r.text)
 
         match = re.search(
-            r"current value of the Fear\s*&\s*Greed Index.*?is\s+(\d+)\s*-\s*([A-Za-z ]+)\.",
-            html,
-            re.IGNORECASE | re.DOTALL
+            r"current value.*?is\s+(\d+)\s*[-–]\s*"
+            r"(extreme fear|fear|neutral|greed|extreme greed)",
+            text,
+            re.IGNORECASE,
         )
 
-        if not match:
-            match = re.search(
-                r"is\s+(\d+)\s*-\s*(extreme fear|fear|neutral|greed|extreme greed)",
-                html,
-                re.IGNORECASE
-            )
-
         if match:
-            score = float(match.group(1))
-            rating = match.group(2).strip().lower()
             return {
-                "value": score,
-                "description": rating,
-                "source": "finhacker"
+                "value": float(match.group(1)),
+                "description": match.group(2).strip().lower(),
+                "source": "finhacker",
             }
 
+        print("Fear & Greed fallback page snippet:", text[:1200])
         raise ValueError("Fear & Greed value not found on fallback page")
 
     except Exception as e:
@@ -247,7 +240,7 @@ def get_market_data():
     sp_peak = float(sp_hist["Close"].max())
     drawdown = (sp_current - sp_peak) / sp_peak * 100
 
-    cnn_fg = get_cnn_fear_greed()
+    fear_greed = get_fear_greed()
 
     return {
         "vix_price": vix_price,
@@ -255,17 +248,17 @@ def get_market_data():
         "sp_current": sp_current,
         "sp_peak": sp_peak,
         "drawdown": drawdown,
-        "cnn_fg": cnn_fg,
+        "fear_greed": fear_greed,
     }
 
 
 def format_market_status():
     data = get_market_data()
 
-    if data["cnn_fg"] is not None:
-        fg_value = round(data["cnn_fg"]["value"])
-        fg_desc = data["cnn_fg"]["description"]
-        fg_source = data["cnn_fg"].get("source", "unknown")
+    if data["fear_greed"] is not None:
+        fg_value = round(data["fear_greed"]["value"])
+        fg_desc = data["fear_greed"]["description"]
+        fg_source = data["fear_greed"].get("source", "unknown")
     else:
         fg_value = "N/A"
         fg_desc = "unavailable"
@@ -282,7 +275,7 @@ def format_market_status():
 
 
 def panic_signal_triggered(data):
-    fg_value = None if data["cnn_fg"] is None else data["cnn_fg"]["value"]
+    fg_value = None if data["fear_greed"] is None else data["fear_greed"]["value"]
 
     return (
         data["vix_price"] > 30
@@ -298,7 +291,7 @@ def run_panic_check(send_normal_status=False):
     data = get_market_data()
 
     print("VIX:", data["vix_price"])
-    print("Fear & Greed:", data["cnn_fg"])
+    print("Fear & Greed:", data["fear_greed"])
     print("Drawdown:", data["drawdown"])
 
     if send_normal_status:
@@ -308,9 +301,9 @@ def run_panic_check(send_normal_status=False):
         now_ts = time.time()
 
         if now_ts - last_panic_alert_time > PANIC_ALERT_COOLDOWN_SECONDS:
-            fg_value = round(data["cnn_fg"]["value"]) if data["cnn_fg"] else "N/A"
-            fg_desc = data["cnn_fg"]["description"] if data["cnn_fg"] else "unavailable"
-            fg_source = data["cnn_fg"].get("source", "unknown") if data["cnn_fg"] else "none"
+            fg_value = round(data["fear_greed"]["value"]) if data["fear_greed"] else "N/A"
+            fg_desc = data["fear_greed"]["description"] if data["fear_greed"] else "unavailable"
+            fg_source = data["fear_greed"].get("source", "unknown") if data["fear_greed"] else "none"
 
             panic_msg = (
                 "🚨 STOCK PANIC ALERT 🚨\n"
@@ -439,7 +432,7 @@ def maybe_send_bitcoin_update(now_et):
             last_btc_price = current_price
 
 
-def maybe_send_vix_alert():
+def maybe_send_vix_alert(now_et):
     global last_vix_price, last_vix_bucket, last_vix_alert_signature
 
     try:
@@ -450,6 +443,7 @@ def maybe_send_vix_alert():
 
     current_bucket = get_vix_bucket(vix_price)
     reasons = []
+    day_key = now_et.strftime("%Y-%m-%d")
 
     if last_vix_bucket is None:
         last_vix_bucket = current_bucket
@@ -467,15 +461,14 @@ def maybe_send_vix_alert():
 
     alert_signature = None
     if reasons:
-        alert_signature = f"{current_bucket}|{round(vix_change, 2)}"
+        alert_signature = f"{day_key}|{current_bucket}|{round(vix_change, 2)}"
 
     if reasons and alert_signature != last_vix_alert_signature:
-        reason_text = ", ".join(reasons)
         msg = (
             "⚠️ VIX Alert\n"
             f"VIX: {vix_price:.2f}\n"
             f"Daily change: {vix_change:+.2f}%\n"
-            f"Reason: {reason_text}"
+            f"Reason: {', '.join(reasons)}"
         )
         if send_telegram_message(msg):
             last_vix_alert_signature = alert_signature
@@ -557,10 +550,10 @@ def handle_command(text):
         try:
             data = run_panic_check(send_normal_status=False)
             triggered = panic_signal_triggered(data)
-            if data["cnn_fg"] is not None:
-                fg_value = round(data["cnn_fg"]["value"])
-                fg_desc = data["cnn_fg"]["description"]
-                fg_source = data["cnn_fg"].get("source", "unknown")
+            if data["fear_greed"] is not None:
+                fg_value = round(data["fear_greed"]["value"])
+                fg_desc = data["fear_greed"]["description"]
+                fg_source = data["fear_greed"].get("source", "unknown")
             else:
                 fg_value = "N/A"
                 fg_desc = "unavailable"
@@ -635,7 +628,7 @@ def main():
             maybe_send_stock_update(now_et)
             maybe_send_futures_update(now_et)
             maybe_send_bitcoin_update(now_et)
-            maybe_send_vix_alert()
+            maybe_send_vix_alert(now_et)
             run_panic_check(send_normal_status=False)
 
             time.sleep(MAIN_LOOP_SECONDS)
