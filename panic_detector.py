@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import requests
 import yfinance as yf
@@ -67,6 +68,7 @@ last_btc_send_time = None
 last_btc_price = None
 last_vix_price = None
 last_vix_bucket = None
+last_vix_alert_signature = None
 
 
 def require_env():
@@ -82,10 +84,7 @@ def send_telegram_message(text):
     try:
         r = requests.post(
             url,
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text,
-            },
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
             timeout=20,
         )
         print("Telegram send status:", r.status_code)
@@ -114,11 +113,12 @@ def get_telegram_updates(offset=None, timeout=15):
 
 
 def get_cnn_fear_greed():
-    url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+    # Primary: older CNN-style endpoint
+    cnn_url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 
     try:
         r = requests.get(
-            url,
+            cnn_url,
             timeout=15,
             headers={"User-Agent": "Mozilla/5.0"}
         )
@@ -139,16 +139,54 @@ def get_cnn_fear_greed():
             if "rating" in data:
                 rating = data.get("rating", rating)
 
-        if score is None:
-            raise ValueError("CNN Fear & Greed score not found")
-
-        return {
-            "value": float(score),
-            "description": str(rating),
-        }
+        if score is not None:
+            return {
+                "value": float(score),
+                "description": str(rating),
+                "source": "cnn"
+            }
 
     except Exception as e:
-        print("CNN Fear & Greed fetch error:", e)
+        print("CNN Fear & Greed primary fetch failed:", e)
+
+    # Fallback: Finhacker mirror
+    fallback_url = "https://www.finhacker.cz/en/fear-and-greed-index-historical-data-and-chart/"
+
+    try:
+        r = requests.get(
+            fallback_url,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        r.raise_for_status()
+        html = r.text
+
+        match = re.search(
+            r"current value of the Fear\s*&\s*Greed Index.*?is\s+(\d+)\s*-\s*([A-Za-z ]+)\.",
+            html,
+            re.IGNORECASE | re.DOTALL
+        )
+
+        if not match:
+            match = re.search(
+                r"is\s+(\d+)\s*-\s*(extreme fear|fear|neutral|greed|extreme greed)",
+                html,
+                re.IGNORECASE
+            )
+
+        if match:
+            score = float(match.group(1))
+            rating = match.group(2).strip().lower()
+            return {
+                "value": score,
+                "description": rating,
+                "source": "finhacker"
+            }
+
+        raise ValueError("Fear & Greed value not found on fallback page")
+
+    except Exception as e:
+        print("Fear & Greed fallback fetch failed:", e)
         return None
 
 
@@ -176,7 +214,6 @@ def get_intraday_price(ticker):
     hist = stock.history(period="2d", interval="30m")
 
     if hist.empty or hist["Close"].dropna().empty:
-        # fallback to daily
         latest, _ = get_last_price_and_change(ticker)
         return latest
 
@@ -228,14 +265,16 @@ def format_market_status():
     if data["cnn_fg"] is not None:
         fg_value = round(data["cnn_fg"]["value"])
         fg_desc = data["cnn_fg"]["description"]
+        fg_source = data["cnn_fg"].get("source", "unknown")
     else:
         fg_value = "N/A"
         fg_desc = "unavailable"
+        fg_source = "none"
 
     return (
         "📊 Market Status\n"
         f"VIX: {data['vix_price']:.2f} ({data['vix_change']:+.2f}%)\n"
-        f"CNN Fear & Greed: {fg_value} ({fg_desc})\n"
+        f"Fear & Greed: {fg_value} ({fg_desc}) [{fg_source}]\n"
         f"S&P 500: {data['sp_current']:.2f}\n"
         f"1Y Peak: {data['sp_peak']:.2f}\n"
         f"Drawdown: {data['drawdown']:.2f}%"
@@ -246,10 +285,10 @@ def panic_signal_triggered(data):
     fg_value = None if data["cnn_fg"] is None else data["cnn_fg"]["value"]
 
     return (
-        fg_value is not None
-        and data["vix_price"] > 30
-        and fg_value < 25
+        data["vix_price"] > 30
         and data["drawdown"] < -10
+        and fg_value is not None
+        and fg_value < 30
     )
 
 
@@ -259,7 +298,7 @@ def run_panic_check(send_normal_status=False):
     data = get_market_data()
 
     print("VIX:", data["vix_price"])
-    print("CNN Fear & Greed:", data["cnn_fg"])
+    print("Fear & Greed:", data["cnn_fg"])
     print("Drawdown:", data["drawdown"])
 
     if send_normal_status:
@@ -271,11 +310,12 @@ def run_panic_check(send_normal_status=False):
         if now_ts - last_panic_alert_time > PANIC_ALERT_COOLDOWN_SECONDS:
             fg_value = round(data["cnn_fg"]["value"]) if data["cnn_fg"] else "N/A"
             fg_desc = data["cnn_fg"]["description"] if data["cnn_fg"] else "unavailable"
+            fg_source = data["cnn_fg"].get("source", "unknown") if data["cnn_fg"] else "none"
 
             panic_msg = (
                 "🚨 STOCK PANIC ALERT 🚨\n"
                 f"VIX: {data['vix_price']:.2f}\n"
-                f"CNN Fear & Greed: {fg_value} ({fg_desc})\n"
+                f"Fear & Greed: {fg_value} ({fg_desc}) [{fg_source}]\n"
                 f"S&P 500 Drawdown: {data['drawdown']:.2f}%"
             )
 
@@ -294,7 +334,6 @@ def is_weekday_et(now_et):
 def is_stock_market_open(now_et):
     if not is_weekday_et(now_et):
         return False
-
     current_time = now_et.time()
     return dt_time(9, 30) <= current_time < dt_time(16, 0)
 
@@ -309,7 +348,6 @@ def get_futures_slot(now_et):
 
     current_time = now_et.time()
 
-    # useful checkpoints
     if dt_time(8, 30) <= current_time < dt_time(8, 40):
         return now_et.strftime("%Y-%m-%d preopen-0830")
     if dt_time(16, 15) <= current_time < dt_time(16, 25):
@@ -394,10 +432,7 @@ def maybe_send_bitcoin_update(now_et):
                     f"Bitcoin: {daily_price:.2f} ({daily_pct:+.2f}% daily)"
                 )
             except Exception:
-                text = (
-                    "₿ Bitcoin 2-Hour Check\n"
-                    f"Bitcoin: {current_price:.2f}"
-                )
+                text = f"₿ Bitcoin 2-Hour Check\nBitcoin: {current_price:.2f}"
 
         if send_telegram_message(text):
             last_btc_send_time = now_et
@@ -405,7 +440,7 @@ def maybe_send_bitcoin_update(now_et):
 
 
 def maybe_send_vix_alert():
-    global last_vix_price, last_vix_bucket
+    global last_vix_price, last_vix_bucket, last_vix_alert_signature
 
     try:
         vix_price, vix_change = get_last_price_and_change(VIX_TICKER)
@@ -414,35 +449,36 @@ def maybe_send_vix_alert():
         return
 
     current_bucket = get_vix_bucket(vix_price)
-    send_alert = False
     reasons = []
 
     if last_vix_bucket is None:
         last_vix_bucket = current_bucket
 
     if current_bucket != last_vix_bucket and current_bucket in {"20-24.99", "25-29.99", "30+"}:
-        send_alert = True
         reasons.append(f"crossed into {current_bucket}")
-
-    if abs(vix_change) >= 10:
-        send_alert = True
-        reasons.append(f"daily move {vix_change:+.2f}%")
 
     if last_vix_price is not None and last_vix_price != 0:
         intrarun_move = ((vix_price - last_vix_price) / last_vix_price) * 100
         if abs(intrarun_move) >= 8:
-            send_alert = True
             reasons.append(f"move since last check {intrarun_move:+.2f}%")
 
-    if send_alert:
-        reason_text = ", ".join(reasons) if reasons else "important VIX move"
+    if abs(vix_change) >= 10:
+        reasons.append(f"daily move {vix_change:+.2f}%")
+
+    alert_signature = None
+    if reasons:
+        alert_signature = f"{current_bucket}|{round(vix_change, 2)}"
+
+    if reasons and alert_signature != last_vix_alert_signature:
+        reason_text = ", ".join(reasons)
         msg = (
             "⚠️ VIX Alert\n"
             f"VIX: {vix_price:.2f}\n"
             f"Daily change: {vix_change:+.2f}%\n"
             f"Reason: {reason_text}"
         )
-        send_telegram_message(msg)
+        if send_telegram_message(msg):
+            last_vix_alert_signature = alert_signature
 
     last_vix_price = vix_price
     last_vix_bucket = current_bucket
@@ -520,14 +556,20 @@ def handle_command(text):
     elif cmd == "/panic":
         try:
             data = run_panic_check(send_normal_status=False)
-            fg_value = round(data["cnn_fg"]["value"]) if data["cnn_fg"] else "N/A"
-            fg_desc = data["cnn_fg"]["description"] if data["cnn_fg"] else "unavailable"
             triggered = panic_signal_triggered(data)
+            if data["cnn_fg"] is not None:
+                fg_value = round(data["cnn_fg"]["value"])
+                fg_desc = data["cnn_fg"]["description"]
+                fg_source = data["cnn_fg"].get("source", "unknown")
+            else:
+                fg_value = "N/A"
+                fg_desc = "unavailable"
+                fg_source = "none"
 
             send_telegram_message(
                 "🧪 Panic Check Complete\n"
                 f"VIX: {data['vix_price']:.2f}\n"
-                f"CNN Fear & Greed: {fg_value} ({fg_desc})\n"
+                f"Fear & Greed: {fg_value} ({fg_desc}) [{fg_source}]\n"
                 f"Drawdown: {data['drawdown']:.2f}%\n"
                 f"Signal: {'ON' if triggered else 'OFF'}"
             )
@@ -572,6 +614,7 @@ def main():
 
     send_telegram_message(
         "✅ Bot started on Railway\n"
+        "Fear & Greed: CNN first, Finhacker fallback\n"
         "Stocks: hourly during market hours\n"
         "Futures: key checkpoints\n"
         "VIX: important alerts only\n"
