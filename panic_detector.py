@@ -7,6 +7,8 @@ import requests
 import yfinance as yf
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from urllib.parse import quote
+import xml.etree.ElementTree as ETXML
 
 # =============================
 # CONFIG
@@ -15,8 +17,8 @@ from zoneinfo import ZoneInfo
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-ET = ZoneInfo("America/New_York")
-ASIA_TZ = ZoneInfo("Asia/Tokyo")  # Japan + Korea bot timing
+ET_TZ = ZoneInfo("America/New_York")
+ASIA_TZ = ZoneInfo("Asia/Tokyo")
 
 MARKET_CHECK_SECONDS = 60
 TELEGRAM_POLL_SECONDS = 3
@@ -25,6 +27,11 @@ TELEGRAM_GETUPDATES_TIMEOUT = 2
 PANIC_ALERT_COOLDOWN_SECONDS = 6 * 60 * 60
 BOND_ALERT_COOLDOWN_SECONDS = 6 * 60 * 60
 CRYPTO_UPDATE_HOURS = 2
+
+NEWSLETTER_HOUR_ASIA = 8
+NEWSLETTER_MINUTE_ASIA = 30
+NEWSLETTER_TOP_N = 2
+NEWSLETTER_MAX_HEADLINE_LEN = 110
 
 STATE_FILE = "bot_state.json"
 
@@ -38,8 +45,7 @@ ETH_TICKER = "ETH-USD"
 XRP_TICKER = "XRP-USD"
 
 # =============================
-# WATCHLIST / "PORTFOLIO"
-# Note: this is a ticker watchlist, not share-count holdings
+# YOUR WATCHLIST
 # =============================
 
 PORTFOLIO_WATCHLIST = {
@@ -67,6 +73,12 @@ CRYPTO_WATCHLIST = {
     "Ripple": XRP_TICKER,
 }
 
+FUTURES_WATCHLIST = {
+    "Dow Futures": "YM=F",
+    "Nasdaq Futures": "NQ=F",
+    "S&P Futures": "ES=F",
+}
+
 JAPAN_MARKETS = {
     "Nikkei 225": "^N225",
     "TOPIX": "^TOPX",
@@ -75,12 +87,6 @@ JAPAN_MARKETS = {
 KOREA_MARKETS = {
     "KOSPI": "^KS11",
     "KOSDAQ": "^KQ11",
-}
-
-FUTURES_WATCHLIST = {
-    "Dow Futures": "YM=F",
-    "Nasdaq Futures": "NQ=F",
-    "S&P Futures": "ES=F",
 }
 
 # =============================
@@ -96,6 +102,7 @@ state = {
     "last_buy_zone_active": False,
     "last_update_id": None,
     "last_asia_open_alert_date": None,
+    "last_newsletter_date": None,
 }
 
 # =============================
@@ -154,7 +161,7 @@ def send_telegram_message(text, chat_id=None):
             timeout=20,
         )
         r.raise_for_status()
-        print("Telegram:", text)
+        print("Telegram:", text[:500])
         return True
     except Exception as e:
         print("Telegram error:", e)
@@ -165,9 +172,7 @@ def get_telegram_updates():
         return []
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {
-        "timeout": TELEGRAM_GETUPDATES_TIMEOUT,
-    }
+    params = {"timeout": TELEGRAM_GETUPDATES_TIMEOUT}
 
     if state.get("last_update_id") is not None:
         params["offset"] = int(state["last_update_id"]) + 1
@@ -228,9 +233,6 @@ def safe_request(url, params=None, headers=None):
 # =============================
 
 def get_crypto_fear_greed():
-    """
-    Reliable crypto fear & greed from alternative.me
-    """
     try:
         r = safe_request("https://api.alternative.me/fng/")
         data = r.json()
@@ -246,8 +248,8 @@ def get_crypto_fear_greed():
 
 def get_stock_fear_greed():
     """
-    Stock-market fear & greed from a public webpage.
-    Falls back later to a proxy if parsing fails.
+    Scrapes a public stock fear/greed page.
+    If parsing breaks, fallback proxy is used later.
     """
     try:
         r = safe_request(
@@ -261,13 +263,7 @@ def get_stock_fear_greed():
         text = html.unescape(text)
         text = re.sub(r"\s+", " ", text).strip()
 
-        # Example target:
-        # "Now Fear 27 Yesterday Fear 33"
-        m = re.search(
-            r"Now\s+([A-Za-z ]+?)\s+(\d{1,3})\s+Yesterday",
-            text,
-            flags=re.I
-        )
+        m = re.search(r"Now\s+([A-Za-z ]+?)\s+(\d{1,3})\s+Yesterday", text, flags=re.I)
         if m:
             return {
                 "value": float(m.group(2)),
@@ -275,12 +271,7 @@ def get_stock_fear_greed():
                 "source": "feargreedmeter.com",
             }
 
-        # backup pattern
-        m2 = re.search(
-            r"Fear and Greed Index.*?Now\s+([A-Za-z ]+?)\s+(\d{1,3})",
-            text,
-            flags=re.I
-        )
+        m2 = re.search(r"Fear and Greed Index.*?Now\s+([A-Za-z ]+?)\s+(\d{1,3})", text, flags=re.I)
         if m2:
             return {
                 "value": float(m2.group(2)),
@@ -294,13 +285,8 @@ def get_stock_fear_greed():
         return None
 
 def build_stock_fear_greed_proxy(vix, drawdown, sp_above_50dma, sp_above_200dma):
-    """
-    Fallback score if webpage scraping breaks.
-    0 = extreme fear, 100 = extreme greed
-    """
     score = 50
 
-    # VIX contribution
     if vix >= 35:
         score -= 30
     elif vix >= 30:
@@ -314,7 +300,6 @@ def build_stock_fear_greed_proxy(vix, drawdown, sp_above_50dma, sp_above_200dma)
     elif vix <= 17:
         score += 10
 
-    # Drawdown contribution
     if drawdown <= -15:
         score -= 25
     elif drawdown <= -10:
@@ -328,16 +313,8 @@ def build_stock_fear_greed_proxy(vix, drawdown, sp_above_50dma, sp_above_200dma)
     elif drawdown >= 1:
         score += 8
 
-    # Trend contribution
-    if sp_above_50dma:
-        score += 8
-    else:
-        score -= 8
-
-    if sp_above_200dma:
-        score += 12
-    else:
-        score -= 12
+    score += 8 if sp_above_50dma else -8
+    score += 12 if sp_above_200dma else -12
 
     score = max(0, min(100, int(round(score))))
 
@@ -363,13 +340,8 @@ def build_stock_fear_greed_proxy(vix, drawdown, sp_above_50dma, sp_above_200dma)
 # =============================
 
 def get_last_price_and_change(ticker):
-    """
-    Tries fast_info first, then daily history.
-    Returns (latest_price, daily_pct_change)
-    """
     asset = yf.Ticker(ticker)
 
-    # Try fast_info
     try:
         fi = asset.fast_info
         latest = fi.get("lastPrice")
@@ -382,7 +354,6 @@ def get_last_price_and_change(ticker):
     except Exception as e:
         print(f"fast_info failed for {ticker}:", e)
 
-    # Fallback to daily history
     hist = asset.history(period="10d", interval="1d", auto_adjust=False)
     closes = hist["Close"].dropna()
 
@@ -438,6 +409,52 @@ def get_market_data():
 # FORMATTERS
 # =============================
 
+def format_quote(name, ticker):
+    price, pct = get_last_price_and_change(ticker)
+    return f"{name}: {price:,.2f} ({pct:+.2f}%)"
+
+def format_watchlist(title, watchlist):
+    lines = [title]
+    for name, ticker in watchlist.items():
+        try:
+            lines.append(format_quote(name, ticker))
+        except Exception as e:
+            lines.append(f"{name}: error ({e})")
+    return "\n".join(lines)
+
+def format_portfolio_watchlist():
+    return format_watchlist("📁 Portfolio Watchlist", PORTFOLIO_WATCHLIST)
+
+def format_crypto_prices():
+    return format_watchlist("💰 Crypto Prices", CRYPTO_WATCHLIST)
+
+def format_futures():
+    return format_watchlist("📉 Futures", FUTURES_WATCHLIST)
+
+def format_japan_markets():
+    return format_watchlist("🇯🇵 Japan Markets", JAPAN_MARKETS)
+
+def format_korea_markets():
+    return format_watchlist("🇰🇷 Korea Markets", KOREA_MARKETS)
+
+def format_asia_markets():
+    lines = ["🌏 Asia Markets", "", "Japan:"]
+    for name, ticker in JAPAN_MARKETS.items():
+        try:
+            lines.append(f"  {format_quote(name, ticker)}")
+        except Exception:
+            lines.append(f"  {name}: error")
+
+    lines.append("")
+    lines.append("Korea:")
+    for name, ticker in KOREA_MARKETS.items():
+        try:
+            lines.append(f"  {format_quote(name, ticker)}")
+        except Exception:
+            lines.append(f"  {name}: error")
+
+    return "\n".join(lines)
+
 def format_market_snapshot(data):
     lines = [
         "📊 Market Snapshot",
@@ -461,56 +478,6 @@ def format_market_snapshot(data):
             f"Crypto Fear & Greed: {int(round(crypto_fg['value']))} "
             f"({crypto_fg['description']}, {crypto_fg['source']})"
         )
-
-    return "\n".join(lines)
-
-def format_quote(name, ticker):
-    price, pct = get_last_price_and_change(ticker)
-    return f"{name}: {price:,.2f} ({pct:+.2f}%)"
-
-def format_watchlist(title, watchlist):
-    lines = [title]
-    for name, ticker in watchlist.items():
-        try:
-            lines.append(format_quote(name, ticker))
-        except Exception:
-            lines.append(f"{name}: error")
-    return "\n".join(lines)
-
-def format_portfolio_watchlist():
-    return format_watchlist("📁 Portfolio Watchlist", PORTFOLIO_WATCHLIST)
-
-def format_crypto_prices():
-    return format_watchlist("💰 Crypto Prices", CRYPTO_WATCHLIST)
-
-def format_futures():
-    return format_watchlist("📉 Futures", FUTURES_WATCHLIST)
-
-def format_japan_markets():
-    return format_watchlist("🇯🇵 Japan Markets", JAPAN_MARKETS)
-
-def format_korea_markets():
-    return format_watchlist("🇰🇷 Korea Markets", KOREA_MARKETS)
-
-def format_asia_markets():
-    lines = [
-        "🌏 Asia Markets",
-        "",
-        "Japan:",
-    ]
-    for name, ticker in JAPAN_MARKETS.items():
-        try:
-            lines.append(f"  {format_quote(name, ticker)}")
-        except Exception:
-            lines.append(f"  {name}: error")
-
-    lines.append("")
-    lines.append("Korea:")
-    for name, ticker in KOREA_MARKETS.items():
-        try:
-            lines.append(f"  {format_quote(name, ticker)}")
-        except Exception:
-            lines.append(f"  {name}: error")
 
     return "\n".join(lines)
 
@@ -632,7 +599,7 @@ def check_buy_zone(data):
 def check_oil_spike():
     try:
         price, pct = get_last_price_and_change(OIL_TICKER)
-        today = datetime.now(ET).date().isoformat()
+        today = datetime.now(ET_TZ).date().isoformat()
 
         if pct > 5 and state.get("last_oil_alert_day") != today:
             msg = (
@@ -686,12 +653,9 @@ def maybe_send_asia_open_snapshot():
     now_asia = datetime.now(ASIA_TZ)
     today = now_asia.date().isoformat()
 
-    # Weekdays only
     if now_asia.weekday() >= 5:
         return
 
-    # Send once shortly after 9am local time
-    # Practical choice for Tokyo/Seoul open snapshot
     if now_asia.hour == 9 and now_asia.minute <= 10:
         if state.get("last_asia_open_alert_date") == today:
             return
@@ -702,7 +666,142 @@ def maybe_send_asia_open_snapshot():
             save_state()
 
 # =============================
-# COMMAND HANDLER
+# NEWSLETTER
+# =============================
+
+def truncate_text(text, max_len=NEWSLETTER_MAX_HEADLINE_LEN):
+    text = re.sub(r"\s+", " ", str(text)).strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3].rstrip() + "..."
+
+def fetch_google_news_rss(query, top_n=2):
+    try:
+        url = (
+            "https://news.google.com/rss/search?"
+            f"q={quote(query)}&hl=en-US&gl=US&ceid=US:en"
+        )
+        r = safe_request(url, headers={"User-Agent": "Mozilla/5.0"})
+        root = ETXML.fromstring(r.content)
+
+        items = []
+        channel = root.find("channel")
+        if channel is None:
+            return []
+
+        for item in channel.findall("item")[:top_n]:
+            title = item.findtext("title", default="").strip()
+            title = html.unescape(title)
+            title = truncate_text(title)
+
+            items.append({"title": title})
+
+        return items
+    except Exception as e:
+        print(f"RSS fetch error for query '{query}':", e)
+        return []
+
+def get_newsletter_sections():
+    return [
+        ("🤖 AI", "artificial intelligence OR generative AI OR OpenAI OR Anthropic OR Nvidia"),
+        ("📈 Investing", "stock market OR federal reserve OR treasury yields OR inflation OR recession"),
+        ("💻 Technology", "technology OR semiconductors OR chips OR Microsoft OR Apple OR Google"),
+        ("🌍 Global Politics", "global politics OR geopolitics OR diplomacy OR war OR election"),
+        ("🇨🇳 China", "China economy OR China politics OR China technology OR China markets"),
+    ]
+
+def build_newsletter():
+    data = get_market_data()
+
+    lines = []
+    now_asia = datetime.now(ASIA_TZ).strftime("%Y-%m-%d %H:%M")
+    lines.append(f"📰 Brian Daily Brief | {now_asia} JST")
+    lines.append("")
+
+    lines.append("📊 Markets")
+    lines.append(f"VIX: {data['vix_price']:.2f} ({data['vix_change']:+.2f}%)")
+    lines.append(f"S&P 500: {data['sp_current']:.2f}")
+    lines.append(f"Drawdown: {data['drawdown']:.2f}%")
+    lines.append(f"Regime: {detect_market_regime(data)}")
+
+    stock_fg = data.get("stock_fear_greed")
+    if stock_fg:
+        lines.append(
+            f"Stock Fear & Greed: {int(round(stock_fg['value']))} ({stock_fg['description']})"
+        )
+
+    crypto_fg = data.get("crypto_fear_greed")
+    if crypto_fg:
+        lines.append(
+            f"Crypto Fear & Greed: {int(round(crypto_fg['value']))} ({crypto_fg['description']})"
+        )
+
+    lines.append("")
+    lines.append("📉 Futures")
+    for name, ticker in FUTURES_WATCHLIST.items():
+        try:
+            price, pct = get_last_price_and_change(ticker)
+            lines.append(f"{name}: {price:,.2f} ({pct:+.2f}%)")
+        except Exception:
+            lines.append(f"{name}: error")
+
+    lines.append("")
+    lines.append("📁 Your Watchlist")
+    for name, ticker in PORTFOLIO_WATCHLIST.items():
+        try:
+            price, pct = get_last_price_and_change(ticker)
+            lines.append(f"{name}: {price:,.2f} ({pct:+.2f}%)")
+        except Exception:
+            lines.append(f"{name}: error")
+
+    lines.append("")
+    lines.append("🌏 Asia")
+    for name, ticker in {**JAPAN_MARKETS, **KOREA_MARKETS}.items():
+        try:
+            price, pct = get_last_price_and_change(ticker)
+            lines.append(f"{name}: {price:,.2f} ({pct:+.2f}%)")
+        except Exception:
+            lines.append(f"{name}: error")
+
+    lines.append("")
+    for section_name, query in get_newsletter_sections():
+        lines.append(section_name)
+        headlines = fetch_google_news_rss(query, top_n=NEWSLETTER_TOP_N)
+
+        if not headlines:
+            lines.append("No update.")
+        else:
+            for item in headlines:
+                lines.append(f"• {item['title']}")
+        lines.append("")
+
+    message = "\n".join(lines).strip()
+
+    if len(message) > 3900:
+        message = message[:3900].rstrip() + "\n\n...[truncated]"
+
+    return message
+
+def maybe_send_daily_newsletter():
+    now_asia = datetime.now(ASIA_TZ)
+    today = now_asia.date().isoformat()
+
+    if now_asia.hour != NEWSLETTER_HOUR_ASIA:
+        return
+
+    if not (NEWSLETTER_MINUTE_ASIA <= now_asia.minute < NEWSLETTER_MINUTE_ASIA + 5):
+        return
+
+    if state.get("last_newsletter_date") == today:
+        return
+
+    msg = build_newsletter()
+    if send_telegram_message(msg):
+        state["last_newsletter_date"] = today
+        save_state()
+
+# =============================
+# COMMANDS
 # =============================
 
 def handle_command(text):
@@ -714,11 +813,9 @@ def handle_command(text):
     cmd = parts[0].lower()
     args = parts[1:]
 
-    # support /price@YourBotName
     if "@" in cmd:
         cmd = cmd.split("@", 1)[0]
 
-    # support plain words too
     if not cmd.startswith("/"):
         cmd = "/" + cmd
 
@@ -740,6 +837,7 @@ def handle_command(text):
                 "/japan - Nikkei + TOPIX\n"
                 "/korea - KOSPI + KOSDAQ\n"
                 "/asia - Japan + Korea snapshot\n"
+                "/newsletter - full daily briefing\n"
                 "/help - command list"
             )
 
@@ -808,6 +906,9 @@ def handle_command(text):
         if cmd == "/asia":
             return format_asia_markets()
 
+        if cmd == "/newsletter":
+            return build_newsletter()
+
         return "Unknown command. Type /help"
 
     except Exception as e:
@@ -856,13 +957,11 @@ def main():
 
     while True:
         try:
-            # fast command polling
             check_telegram_commands()
 
-            # scheduled checks
             now_ts = time.time()
             if now_ts >= next_market_check:
-                now_et = datetime.now(ET)
+                now_et = datetime.now(ET_TZ)
 
                 data = run_panic_check()
                 maybe_send_regime_alert(data)
@@ -871,6 +970,7 @@ def main():
                 check_bond_spike()
                 maybe_send_crypto_update(now_et)
                 maybe_send_asia_open_snapshot()
+                maybe_send_daily_newsletter()
 
                 next_market_check = now_ts + MARKET_CHECK_SECONDS
 
