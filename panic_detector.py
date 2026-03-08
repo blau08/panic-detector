@@ -1,5 +1,7 @@
 import os
+import re
 import json
+import html
 import time
 import requests
 import yfinance as yf
@@ -14,11 +16,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 ET = ZoneInfo("America/New_York")
+ASIA_TZ = ZoneInfo("Asia/Tokyo")  # Japan + Korea bot timing
 
-# how often to run automatic market checks
 MARKET_CHECK_SECONDS = 60
-
-# how often to poll Telegram for new commands
 TELEGRAM_POLL_SECONDS = 3
 TELEGRAM_GETUPDATES_TIMEOUT = 2
 
@@ -30,24 +30,57 @@ STATE_FILE = "bot_state.json"
 
 VIX_TICKER = "^VIX"
 SP_TICKER = "^GSPC"
-BTC_TICKER = "BTC-USD"
-ETH_TICKER = "ETH-USD"
-XRP_TICKER = "XRP-USD"
 OIL_TICKER = "CL=F"
 BOND_TICKER = "^TNX"
 
+BTC_TICKER = "BTC-USD"
+ETH_TICKER = "ETH-USD"
+XRP_TICKER = "XRP-USD"
+
 # =============================
-# PORTFOLIO
-# Edit this with your real holdings
+# WATCHLIST / "PORTFOLIO"
+# Note: this is a ticker watchlist, not share-count holdings
 # =============================
 
-PORTFOLIO = {
-    # "NVDA": 110,
-    # "META": 55,
-    # "GOOGL": 55,
-    # "VTI": 22,
-    # "VOO": 12,
-    # "SOFI": 800,
+PORTFOLIO_WATCHLIST = {
+    "NVDA": "NVDA",
+    "META": "META",
+    "GOOGL": "GOOGL",
+    "MSFT": "MSFT",
+    "AVGO": "AVGO",
+    "AMD": "AMD",
+    "TSM": "TSM",
+    "SOFI": "SOFI",
+    "INTC": "INTC",
+    "VOO": "VOO",
+    "VTI": "VTI",
+    "VXUS": "VXUS",
+    "Bitcoin": "BTC-USD",
+    "Dow Futures": "YM=F",
+    "Nasdaq Futures": "NQ=F",
+    "S&P Futures": "ES=F",
+}
+
+CRYPTO_WATCHLIST = {
+    "Bitcoin": BTC_TICKER,
+    "Ethereum": ETH_TICKER,
+    "Ripple": XRP_TICKER,
+}
+
+JAPAN_MARKETS = {
+    "Nikkei 225": "^N225",
+    "TOPIX": "^TOPX",
+}
+
+KOREA_MARKETS = {
+    "KOSPI": "^KS11",
+    "KOSDAQ": "^KQ11",
+}
+
+FUTURES_WATCHLIST = {
+    "Dow Futures": "YM=F",
+    "Nasdaq Futures": "NQ=F",
+    "S&P Futures": "ES=F",
 }
 
 # =============================
@@ -57,11 +90,12 @@ PORTFOLIO = {
 state = {
     "last_panic_alert_time": 0,
     "last_regime": None,
-    "last_crypto_update": None,   # ISO string
-    "last_oil_alert_day": None,   # YYYY-MM-DD
+    "last_crypto_update": None,
+    "last_oil_alert_day": None,
     "last_bond_alert_time": 0,
     "last_buy_zone_active": False,
     "last_update_id": None,
+    "last_asia_open_alert_date": None,
 }
 
 # =============================
@@ -153,15 +187,11 @@ def get_telegram_updates():
             save_state()
 
         return updates
-
     except Exception as e:
         print("Telegram update error:", e)
         return []
 
 def bootstrap_telegram_offset():
-    """
-    Ignore old queued commands when the bot starts/restarts.
-    """
     if not TELEGRAM_BOT_TOKEN:
         return
 
@@ -182,22 +212,25 @@ def bootstrap_telegram_offset():
 # SAFE REQUEST
 # =============================
 
-def safe_request(url):
+def safe_request(url, params=None, headers=None):
     for _ in range(3):
         try:
-            r = requests.get(url, timeout=15)
+            r = requests.get(url, params=params, headers=headers, timeout=20)
             r.raise_for_status()
             return r
         except Exception as e:
             print("Retry request:", e)
             time.sleep(2)
-    raise Exception("Request failed")
+    raise Exception(f"Request failed: {url}")
 
 # =============================
-# FEAR & GREED
+# SENTIMENT
 # =============================
 
-def get_fear_greed():
+def get_crypto_fear_greed():
+    """
+    Reliable crypto fear & greed from alternative.me
+    """
     try:
         r = safe_request("https://api.alternative.me/fng/")
         data = r.json()
@@ -208,41 +241,186 @@ def get_fear_greed():
             "source": "alternative.me",
         }
     except Exception as e:
-        print("Fear & Greed API failed:", e)
+        print("Crypto Fear & Greed API failed:", e)
         return None
+
+def get_stock_fear_greed():
+    """
+    Stock-market fear & greed from a public webpage.
+    Falls back later to a proxy if parsing fails.
+    """
+    try:
+        r = safe_request(
+            "https://feargreedmeter.com/",
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        page = r.text
+        text = re.sub(r"<script.*?</script>", " ", page, flags=re.S | re.I)
+        text = re.sub(r"<style.*?</style>", " ", text, flags=re.S | re.I)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = html.unescape(text)
+        text = re.sub(r"\s+", " ", text).strip()
+
+        # Example target:
+        # "Now Fear 27 Yesterday Fear 33"
+        m = re.search(
+            r"Now\s+([A-Za-z ]+?)\s+(\d{1,3})\s+Yesterday",
+            text,
+            flags=re.I
+        )
+        if m:
+            return {
+                "value": float(m.group(2)),
+                "description": m.group(1).strip().lower(),
+                "source": "feargreedmeter.com",
+            }
+
+        # backup pattern
+        m2 = re.search(
+            r"Fear and Greed Index.*?Now\s+([A-Za-z ]+?)\s+(\d{1,3})",
+            text,
+            flags=re.I
+        )
+        if m2:
+            return {
+                "value": float(m2.group(2)),
+                "description": m2.group(1).strip().lower(),
+                "source": "feargreedmeter.com",
+            }
+
+        raise ValueError("Could not parse stock fear & greed")
+    except Exception as e:
+        print("Stock Fear & Greed scrape failed:", e)
+        return None
+
+def build_stock_fear_greed_proxy(vix, drawdown, sp_above_50dma, sp_above_200dma):
+    """
+    Fallback score if webpage scraping breaks.
+    0 = extreme fear, 100 = extreme greed
+    """
+    score = 50
+
+    # VIX contribution
+    if vix >= 35:
+        score -= 30
+    elif vix >= 30:
+        score -= 22
+    elif vix >= 25:
+        score -= 15
+    elif vix >= 20:
+        score -= 8
+    elif vix <= 14:
+        score += 18
+    elif vix <= 17:
+        score += 10
+
+    # Drawdown contribution
+    if drawdown <= -15:
+        score -= 25
+    elif drawdown <= -10:
+        score -= 18
+    elif drawdown <= -6:
+        score -= 10
+    elif drawdown <= -3:
+        score -= 5
+    elif drawdown >= 3:
+        score += 15
+    elif drawdown >= 1:
+        score += 8
+
+    # Trend contribution
+    if sp_above_50dma:
+        score += 8
+    else:
+        score -= 8
+
+    if sp_above_200dma:
+        score += 12
+    else:
+        score -= 12
+
+    score = max(0, min(100, int(round(score))))
+
+    if score <= 24:
+        desc = "extreme fear"
+    elif score <= 44:
+        desc = "fear"
+    elif score <= 55:
+        desc = "neutral"
+    elif score <= 74:
+        desc = "greed"
+    else:
+        desc = "extreme greed"
+
+    return {
+        "value": float(score),
+        "description": desc,
+        "source": "proxy",
+    }
 
 # =============================
 # MARKET DATA
 # =============================
 
-def get_last_price_stats(ticker):
+def get_last_price_and_change(ticker):
+    """
+    Tries fast_info first, then daily history.
+    Returns (latest_price, daily_pct_change)
+    """
     asset = yf.Ticker(ticker)
-    hist = asset.history(period="10d")
 
+    # Try fast_info
+    try:
+        fi = asset.fast_info
+        latest = fi.get("lastPrice")
+        prev_close = fi.get("previousClose")
+        if latest is not None and prev_close not in (None, 0):
+            latest = float(latest)
+            prev_close = float(prev_close)
+            pct_change = ((latest - prev_close) / prev_close) * 100
+            return latest, pct_change
+    except Exception as e:
+        print(f"fast_info failed for {ticker}:", e)
+
+    # Fallback to daily history
+    hist = asset.history(period="10d", interval="1d", auto_adjust=False)
     closes = hist["Close"].dropna()
+
     if len(closes) < 2:
         raise ValueError(f"Not enough price history for {ticker}")
 
     latest = float(closes.iloc[-1])
     prev = float(closes.iloc[-2])
     pct_change = ((latest - prev) / prev) * 100
-    return latest, prev, pct_change
+    return latest, pct_change
 
 def get_market_data():
-    vix_price, _, vix_change = get_last_price_stats(VIX_TICKER)
+    vix_price, vix_change = get_last_price_and_change(VIX_TICKER)
 
     sp = yf.Ticker(SP_TICKER)
-    hist = sp.history(period="1y")
+    hist = sp.history(period="1y", interval="1d", auto_adjust=False)
     closes = hist["Close"].dropna()
 
-    if len(closes) == 0:
-        raise ValueError("No S&P data available")
+    if len(closes) < 200:
+        raise ValueError("Not enough S&P history")
 
     sp_current = float(closes.iloc[-1])
     sp_peak = float(closes.max())
     drawdown = (sp_current - sp_peak) / sp_peak * 100
 
-    fear_greed = get_fear_greed()
+    sma50 = float(closes.tail(50).mean())
+    sma200 = float(closes.tail(200).mean())
+
+    stock_fg = get_stock_fear_greed()
+    if stock_fg is None:
+        stock_fg = build_stock_fear_greed_proxy(
+            vix=vix_price,
+            drawdown=drawdown,
+            sp_above_50dma=(sp_current >= sma50),
+            sp_above_200dma=(sp_current >= sma200),
+        )
+
+    crypto_fg = get_crypto_fear_greed()
 
     return {
         "vix_price": vix_price,
@@ -250,7 +428,10 @@ def get_market_data():
         "sp_current": sp_current,
         "sp_peak": sp_peak,
         "drawdown": drawdown,
-        "fear_greed": fear_greed,
+        "sma50": sma50,
+        "sma200": sma200,
+        "stock_fear_greed": stock_fg,
+        "crypto_fear_greed": crypto_fg,
     }
 
 # =============================
@@ -267,70 +448,69 @@ def format_market_snapshot(data):
         f"Regime: {detect_market_regime(data)}",
     ]
 
-    if data["fear_greed"]:
-        fg = round(data["fear_greed"]["value"])
-        desc = data["fear_greed"]["description"]
-        lines.append(f"Fear & Greed: {fg} ({desc})")
-    else:
-        lines.append("Fear & Greed: unavailable")
+    stock_fg = data.get("stock_fear_greed")
+    if stock_fg:
+        lines.append(
+            f"Stock Fear & Greed: {int(round(stock_fg['value']))} "
+            f"({stock_fg['description']}, {stock_fg['source']})"
+        )
+
+    crypto_fg = data.get("crypto_fear_greed")
+    if crypto_fg:
+        lines.append(
+            f"Crypto Fear & Greed: {int(round(crypto_fg['value']))} "
+            f"({crypto_fg['description']}, {crypto_fg['source']})"
+        )
 
     return "\n".join(lines)
 
-def format_quote(ticker):
-    price, prev, pct = get_last_price_stats(ticker)
-    return (
-        f"📈 {ticker.upper()}\n"
-        f"Price: {price:,.2f}\n"
-        f"Prev Close: {prev:,.2f}\n"
-        f"Daily Move: {pct:+.2f}%"
-    )
+def format_quote(name, ticker):
+    price, pct = get_last_price_and_change(ticker)
+    return f"{name}: {price:,.2f} ({pct:+.2f}%)"
 
-def format_crypto_prices():
-    cryptos = {
-        "Bitcoin": BTC_TICKER,
-        "Ethereum": ETH_TICKER,
-        "Ripple": XRP_TICKER,
-    }
-
-    lines = ["💰 Crypto Prices"]
-    for name, ticker in cryptos.items():
+def format_watchlist(title, watchlist):
+    lines = [title]
+    for name, ticker in watchlist.items():
         try:
-            price, _, pct = get_last_price_stats(ticker)
-            lines.append(f"{name}: {price:,.2f} ({pct:+.2f}%)")
+            lines.append(format_quote(name, ticker))
         except Exception:
             lines.append(f"{name}: error")
     return "\n".join(lines)
 
-def format_portfolio():
-    if not PORTFOLIO:
-        return (
-            "📁 Portfolio is empty.\n\n"
-            "Edit PORTFOLIO at the top of the script, for example:\n"
-            'PORTFOLIO = {"NVDA": 110, "META": 55, "GOOGL": 55}'
-        )
+def format_portfolio_watchlist():
+    return format_watchlist("📁 Portfolio Watchlist", PORTFOLIO_WATCHLIST)
 
-    lines = ["📁 Portfolio"]
-    total_value = 0.0
-    total_daily_pnl = 0.0
+def format_crypto_prices():
+    return format_watchlist("💰 Crypto Prices", CRYPTO_WATCHLIST)
 
-    for ticker, shares in PORTFOLIO.items():
+def format_futures():
+    return format_watchlist("📉 Futures", FUTURES_WATCHLIST)
+
+def format_japan_markets():
+    return format_watchlist("🇯🇵 Japan Markets", JAPAN_MARKETS)
+
+def format_korea_markets():
+    return format_watchlist("🇰🇷 Korea Markets", KOREA_MARKETS)
+
+def format_asia_markets():
+    lines = [
+        "🌏 Asia Markets",
+        "",
+        "Japan:",
+    ]
+    for name, ticker in JAPAN_MARKETS.items():
         try:
-            price, prev, pct = get_last_price_stats(ticker)
-            value = price * shares
-            daily_pnl = (price - prev) * shares
-
-            total_value += value
-            total_daily_pnl += daily_pnl
-
-            lines.append(
-                f"{ticker}: {shares} sh | {price:,.2f} ({pct:+.2f}%) | ${value:,.2f}"
-            )
+            lines.append(f"  {format_quote(name, ticker)}")
         except Exception:
-            lines.append(f"{ticker}: error")
+            lines.append(f"  {name}: error")
 
     lines.append("")
-    lines.append(f"Total Value: ${total_value:,.2f}")
-    lines.append(f"Daily P/L: ${total_daily_pnl:+,.2f}")
+    lines.append("Korea:")
+    for name, ticker in KOREA_MARKETS.items():
+        try:
+            lines.append(f"  {format_quote(name, ticker)}")
+        except Exception:
+            lines.append(f"  {name}: error")
 
     return "\n".join(lines)
 
@@ -341,7 +521,11 @@ def format_portfolio():
 def detect_market_regime(data):
     vix = data["vix_price"]
     drawdown = data["drawdown"]
-    fg = data["fear_greed"]["value"] if data["fear_greed"] else None
+    fg = None
+
+    stock_fg = data.get("stock_fear_greed")
+    if stock_fg:
+        fg = stock_fg["value"]
 
     if vix >= 35 and drawdown <= -12:
         return "CRISIS"
@@ -365,10 +549,12 @@ def maybe_send_regime_alert(data):
             f"Drawdown: {data['drawdown']:.2f}%"
         )
 
-        if data["fear_greed"]:
-            fg = round(data["fear_greed"]["value"])
-            desc = data["fear_greed"]["description"]
-            msg += f"\nFear & Greed: {fg} ({desc})"
+        stock_fg = data.get("stock_fear_greed")
+        if stock_fg:
+            msg += (
+                f"\nStock Fear & Greed: {int(round(stock_fg['value']))} "
+                f"({stock_fg['description']}, {stock_fg['source']})"
+            )
 
         if send_telegram_message(msg):
             state["last_regime"] = regime
@@ -379,7 +565,10 @@ def maybe_send_regime_alert(data):
 # =============================
 
 def panic_signal_triggered(data):
-    fg = data["fear_greed"]["value"] if data["fear_greed"] else None
+    fg = None
+    stock_fg = data.get("stock_fear_greed")
+    if stock_fg:
+        fg = stock_fg["value"]
 
     return (
         data["vix_price"] >= 30
@@ -395,12 +584,16 @@ def run_panic_check():
         now_ts = time.time()
 
         if now_ts - state.get("last_panic_alert_time", 0) > PANIC_ALERT_COOLDOWN_SECONDS:
-            fg = round(data["fear_greed"]["value"]) if data["fear_greed"] else "N/A"
+            stock_fg = data.get("stock_fear_greed")
+            fg_text = (
+                f"{int(round(stock_fg['value']))} ({stock_fg['description']})"
+                if stock_fg else "N/A"
+            )
 
             msg = (
                 "🚨 STOCK PANIC ALERT 🚨\n\n"
                 f"VIX: {data['vix_price']:.2f}\n"
-                f"Fear & Greed: {fg}\n"
+                f"Stock Fear & Greed: {fg_text}\n"
                 f"Drawdown: {data['drawdown']:.2f}%"
             )
 
@@ -433,12 +626,12 @@ def check_buy_zone(data):
         save_state()
 
 # =============================
-# OIL ALERT
+# OIL / BONDS
 # =============================
 
 def check_oil_spike():
     try:
-        price, _, pct = get_last_price_stats(OIL_TICKER)
+        price, pct = get_last_price_and_change(OIL_TICKER)
         today = datetime.now(ET).date().isoformat()
 
         if pct > 5 and state.get("last_oil_alert_day") != today:
@@ -451,17 +644,12 @@ def check_oil_spike():
             if send_telegram_message(msg):
                 state["last_oil_alert_day"] = today
                 save_state()
-
     except Exception as e:
         print("Oil check error:", e)
 
-# =============================
-# BOND ALERT
-# =============================
-
 def check_bond_spike():
     try:
-        price, _, pct = get_last_price_stats(BOND_TICKER)
+        price, pct = get_last_price_and_change(BOND_TICKER)
         now_ts = time.time()
 
         if abs(pct) > 3 and now_ts - state.get("last_bond_alert_time", 0) > BOND_ALERT_COOLDOWN_SECONDS:
@@ -474,12 +662,11 @@ def check_bond_spike():
             if send_telegram_message(msg):
                 state["last_bond_alert_time"] = now_ts
                 save_state()
-
     except Exception as e:
         print("Bond check error:", e)
 
 # =============================
-# CRYPTO
+# CRYPTO UPDATE
 # =============================
 
 def maybe_send_crypto_update(now_dt):
@@ -492,12 +679,34 @@ def maybe_send_crypto_update(now_dt):
             save_state()
 
 # =============================
+# ASIA OPEN ALERT
+# =============================
+
+def maybe_send_asia_open_snapshot():
+    now_asia = datetime.now(ASIA_TZ)
+    today = now_asia.date().isoformat()
+
+    # Weekdays only
+    if now_asia.weekday() >= 5:
+        return
+
+    # Send once shortly after 9am local time
+    # Practical choice for Tokyo/Seoul open snapshot
+    if now_asia.hour == 9 and now_asia.minute <= 10:
+        if state.get("last_asia_open_alert_date") == today:
+            return
+
+        msg = format_asia_markets()
+        if send_telegram_message("🔔 Asia Open\n\n" + msg):
+            state["last_asia_open_alert_date"] = today
+            save_state()
+
+# =============================
 # COMMAND HANDLER
 # =============================
 
 def handle_command(text):
     text = text.strip()
-
     if not text:
         return None
 
@@ -509,7 +718,7 @@ def handle_command(text):
     if "@" in cmd:
         cmd = cmd.split("@", 1)[0]
 
-    # also allow plain words like "price"
+    # support plain words too
     if not cmd.startswith("/"):
         cmd = "/" + cmd
 
@@ -518,14 +727,19 @@ def handle_command(text):
             return (
                 "📘 Commands\n\n"
                 "/price - market snapshot\n"
-                "/portfolio - your portfolio prices\n"
-                "/quote NVDA - quote for any ticker\n"
+                "/portfolio - your ticker watchlist\n"
+                "/quote NVDA - quote any ticker\n"
                 "/crypto - BTC / ETH / XRP\n"
+                "/futures - Dow / Nasdaq / S&P futures\n"
                 "/vix - VIX check\n"
                 "/oil - oil price\n"
                 "/bond - 10Y yield\n"
                 "/regime - market regime\n"
                 "/panic - panic signal status\n"
+                "/sentiment - stock + crypto fear/greed\n"
+                "/japan - Nikkei + TOPIX\n"
+                "/korea - KOSPI + KOSDAQ\n"
+                "/asia - Japan + Korea snapshot\n"
                 "/help - command list"
             )
 
@@ -534,41 +748,65 @@ def handle_command(text):
             return format_market_snapshot(data)
 
         if cmd == "/portfolio":
-            return format_portfolio()
+            return format_portfolio_watchlist()
 
         if cmd == "/quote":
             if not args:
                 return "Usage: /quote NVDA"
             ticker = args[0].upper()
-            return format_quote(ticker)
+            return format_quote(ticker, ticker)
 
         if cmd == "/crypto":
             return format_crypto_prices()
 
+        if cmd == "/futures":
+            return format_futures()
+
         if cmd == "/vix":
-            return format_quote(VIX_TICKER)
+            return format_quote("VIX", VIX_TICKER)
 
         if cmd == "/oil":
-            return format_quote(OIL_TICKER)
+            return format_quote("Crude Oil", OIL_TICKER)
 
         if cmd == "/bond":
-            return format_quote(BOND_TICKER)
+            return format_quote("US 10Y Yield", BOND_TICKER)
 
         if cmd == "/regime":
             data = get_market_data()
-            return (
-                f"🌎 Regime: {detect_market_regime(data)}\n\n"
-                + format_market_snapshot(data)
-            )
+            return f"🌎 Regime: {detect_market_regime(data)}\n\n{format_market_snapshot(data)}"
 
         if cmd == "/panic":
             data = get_market_data()
-            triggered = panic_signal_triggered(data)
-            return (
-                "🚨 Panic signal: ON\n\n" + format_market_snapshot(data)
-                if triggered
-                else "✅ Panic signal: OFF\n\n" + format_market_snapshot(data)
-            )
+            if panic_signal_triggered(data):
+                return "🚨 Panic signal: ON\n\n" + format_market_snapshot(data)
+            return "✅ Panic signal: OFF\n\n" + format_market_snapshot(data)
+
+        if cmd == "/sentiment":
+            data = get_market_data()
+            stock_fg = data.get("stock_fear_greed")
+            crypto_fg = data.get("crypto_fear_greed")
+
+            lines = ["😬 Sentiment"]
+            if stock_fg:
+                lines.append(
+                    f"Stock Fear & Greed: {int(round(stock_fg['value']))} "
+                    f"({stock_fg['description']}, {stock_fg['source']})"
+                )
+            if crypto_fg:
+                lines.append(
+                    f"Crypto Fear & Greed: {int(round(crypto_fg['value']))} "
+                    f"({crypto_fg['description']}, {crypto_fg['source']})"
+                )
+            return "\n".join(lines)
+
+        if cmd == "/japan":
+            return format_japan_markets()
+
+        if cmd == "/korea":
+            return format_korea_markets()
+
+        if cmd == "/asia":
+            return format_asia_markets()
 
         return "Unknown command. Type /help"
 
@@ -586,7 +824,6 @@ def check_telegram_commands():
         msg = update["message"]
         chat_id = str(msg.get("chat", {}).get("id", ""))
 
-        # only allow your approved chat ID
         if str(chat_id) != str(TELEGRAM_CHAT_ID):
             continue
 
@@ -622,17 +859,18 @@ def main():
             # fast command polling
             check_telegram_commands()
 
-            # slower automatic checks
+            # scheduled checks
             now_ts = time.time()
             if now_ts >= next_market_check:
-                now_dt = datetime.now(ET)
+                now_et = datetime.now(ET)
 
                 data = run_panic_check()
                 maybe_send_regime_alert(data)
                 check_buy_zone(data)
                 check_oil_spike()
                 check_bond_spike()
-                maybe_send_crypto_update(now_dt)
+                maybe_send_crypto_update(now_et)
+                maybe_send_asia_open_snapshot()
 
                 next_market_check = now_ts + MARKET_CHECK_SECONDS
 
