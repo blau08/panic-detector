@@ -30,6 +30,9 @@ BOND_ALERT_COOLDOWN_SECONDS = 6 * 60 * 60
 US_OPEN_ALERT_WINDOW_MINUTES = 15
 US_FUTURES_UPDATE_HOURS = 3
 
+ASIA_OPEN_ALERT_HOUR = 9
+ASIA_OPEN_ALERT_WINDOW_MINUTES = 15
+
 NEWSLETTER_HOUR_ASIA = 8
 NEWSLETTER_MINUTE_ASIA = 30
 NEWSLETTER_TOP_N = 2
@@ -85,6 +88,11 @@ JAPAN_MARKETS = {
 KOREA_MARKETS = {
     "KOSPI": "^KS11",
     "KOSDAQ": "^KQ11",
+}
+
+# Fallback aliases when Yahoo is flaky for a symbol
+TICKER_ALIASES = {
+    "998405.T": ["^TOPX"],  # TOPIX primary + fallback
 }
 
 # =============================
@@ -272,6 +280,15 @@ def get_futures_bucket(now_et):
     bucket_hour = (now_et.hour // US_FUTURES_UPDATE_HOURS) * US_FUTURES_UPDATE_HOURS
     return f"{now_et.strftime('%Y-%m-%d')}-{bucket_hour:02d}"
 
+def in_asia_open_alert_window(now_asia):
+    if now_asia.weekday() >= 5:
+        return False
+
+    mins = now_asia.hour * 60 + now_asia.minute
+    start = ASIA_OPEN_ALERT_HOUR * 60
+    end = start + ASIA_OPEN_ALERT_WINDOW_MINUTES
+    return start <= mins < end
+
 # =============================
 # SENTIMENT
 # =============================
@@ -376,57 +393,114 @@ def build_stock_fear_greed_proxy(vix, drawdown, sp_above_50dma, sp_above_200dma)
     }
 
 # =============================
-# MARKET DATA
+# MARKET DATA HELPERS
 # =============================
 
-def get_last_price_and_change(ticker):
-    asset = yf.Ticker(ticker)
+def _calc_pct(latest, prev_close):
+    if latest is None or prev_close in (None, 0):
+        raise ValueError("Missing latest or previous close")
+    latest = float(latest)
+    prev_close = float(prev_close)
+    pct_change = ((latest - prev_close) / prev_close) * 100
+    return latest, pct_change
 
-    # 1) fast_info
+def _get_from_fast_info(asset, ticker):
     try:
         fi = asset.fast_info
         latest = fi.get("lastPrice")
         prev_close = fi.get("previousClose")
         if latest is not None and prev_close not in (None, 0):
-            latest = float(latest)
-            prev_close = float(prev_close)
-            pct_change = ((latest - prev_close) / prev_close) * 100
-            return latest, pct_change
+            return _calc_pct(latest, prev_close)
     except Exception as e:
         print(f"fast_info failed for {ticker}:", e)
+    return None
 
-    # 2) info fallback
+def _get_from_info(asset, ticker):
     try:
         info = asset.info or {}
         latest = (
             info.get("regularMarketPrice")
             or info.get("currentPrice")
             or info.get("navPrice")
+            or info.get("previousClose")
         )
         prev_close = (
             info.get("regularMarketPreviousClose")
             or info.get("previousClose")
         )
-
         if latest is not None and prev_close not in (None, 0):
-            latest = float(latest)
-            prev_close = float(prev_close)
-            pct_change = ((latest - prev_close) / prev_close) * 100
-            return latest, pct_change
+            return _calc_pct(latest, prev_close)
     except Exception as e:
         print(f"info fallback failed for {ticker}:", e)
+    return None
 
-    # 3) daily history fallback
-    hist = asset.history(period="10d", interval="1d", auto_adjust=False)
-    closes = hist["Close"].dropna()
+def _get_from_history(asset, ticker):
+    # Try multiple windows because some symbols are weird on Yahoo
+    history_attempts = [
+        {"period": "5d", "interval": "1d"},
+        {"period": "1mo", "interval": "1d"},
+        {"period": "3mo", "interval": "1d"},
+    ]
 
-    if len(closes) < 2:
-        raise ValueError(f"Not enough price history for {ticker}")
+    for attempt in history_attempts:
+        try:
+            hist = asset.history(
+                period=attempt["period"],
+                interval=attempt["interval"],
+                auto_adjust=False
+            )
+            closes = hist["Close"].dropna()
 
-    latest = float(closes.iloc[-1])
-    prev = float(closes.iloc[-2])
-    pct_change = ((latest - prev) / prev) * 100
-    return latest, pct_change
+            if len(closes) >= 2:
+                latest = float(closes.iloc[-1])
+                prev = float(closes.iloc[-2])
+                pct_change = ((latest - prev) / prev) * 100
+                return latest, pct_change
+
+            # If only one close exists, try to pair it with previousClose from info
+            if len(closes) == 1:
+                latest = float(closes.iloc[-1])
+                try:
+                    info = asset.info or {}
+                    prev_close = (
+                        info.get("regularMarketPreviousClose")
+                        or info.get("previousClose")
+                    )
+                    if prev_close not in (None, 0):
+                        return _calc_pct(latest, prev_close)
+                except Exception as e:
+                    print(f"single-close info fallback failed for {ticker}:", e)
+
+        except Exception as e:
+            print(f"history fallback failed for {ticker} with {attempt}:", e)
+
+    raise ValueError(f"Not enough price history for {ticker}")
+
+def _get_quote_single(ticker):
+    asset = yf.Ticker(ticker)
+
+    result = _get_from_fast_info(asset, ticker)
+    if result is not None:
+        return result
+
+    result = _get_from_info(asset, ticker)
+    if result is not None:
+        return result
+
+    return _get_from_history(asset, ticker)
+
+def get_last_price_and_change(ticker):
+    tickers_to_try = [ticker] + TICKER_ALIASES.get(ticker, [])
+    last_error = None
+
+    for candidate in tickers_to_try:
+        try:
+            return _get_quote_single(candidate)
+        except Exception as e:
+            last_error = e
+            print(f"Quote attempt failed for {ticker} via {candidate}: {e}")
+
+    raise last_error if last_error else ValueError(f"Failed to fetch quote for {ticker}")
 
 def get_market_data():
     vix_price, vix_change = get_last_price_and_change(VIX_TICKER)
@@ -556,10 +630,17 @@ def build_combined_market_update(title, data):
     lines.append(format_crypto_prices())
 
     message = "\n".join(lines).strip()
+    if len(message) > 3900:
+        message = message[:3900].rstrip() + "\n\n...[truncated]"
+    return message
+
+def build_asia_open_update():
+    lines = ["🔔 Asia Market Open", ""]
+    lines.append(format_asia_markets())
+    message = "\n".join(lines).strip()
 
     if len(message) > 3900:
         message = message[:3900].rstrip() + "\n\n...[truncated]"
-
     return message
 
 # =============================
@@ -749,17 +830,16 @@ def maybe_send_asia_open_snapshot():
     now_asia = datetime.now(ASIA_TZ)
     today = now_asia.date().isoformat()
 
-    if now_asia.weekday() >= 5:
+    if not in_asia_open_alert_window(now_asia):
         return
 
-    if now_asia.hour == 9 and now_asia.minute <= 10:
-        if state.get("last_asia_open_alert_date") == today:
-            return
+    if state.get("last_asia_open_alert_date") == today:
+        return
 
-        msg = format_asia_markets()
-        if send_telegram_message("🔔 Asia Open\n\n" + msg):
-            state["last_asia_open_alert_date"] = today
-            save_state()
+    msg = build_asia_open_update()
+    if send_telegram_message(msg):
+        state["last_asia_open_alert_date"] = today
+        save_state()
 
 # =============================
 # NEWSLETTER
@@ -941,6 +1021,7 @@ def handle_command(text):
                 "/japan - Nikkei + TOPIX\n"
                 "/korea - KOSPI + KOSDAQ\n"
                 "/asia - Japan + Korea snapshot\n"
+                "/asiaopenupdate - send Asia open snapshot now\n"
                 "/newsletter - full daily briefing\n"
                 "/openupdate - send combined U.S. open snapshot now\n"
                 "/futuresupdate - send combined futures snapshot now\n"
@@ -1012,6 +1093,9 @@ def handle_command(text):
         if cmd == "/asia":
             return format_asia_markets()
 
+        if cmd == "/asiaopenupdate":
+            return build_asia_open_update()
+
         if cmd == "/newsletter":
             return build_newsletter()
 
@@ -1081,12 +1165,12 @@ def main():
 
                 maybe_send_us_open_snapshot(now_et, data)
                 maybe_send_us_futures_snapshot(now_et, data)
+                maybe_send_asia_open_snapshot()
                 maybe_send_panic_alert(data)
                 maybe_send_regime_alert(data)
                 check_buy_zone(data)
                 check_oil_spike()
                 check_bond_spike()
-                maybe_send_asia_open_snapshot()
                 maybe_send_daily_newsletter()
 
                 next_market_check = now_ts + MARKET_CHECK_SECONDS
