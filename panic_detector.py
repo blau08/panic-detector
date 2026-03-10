@@ -5,7 +5,8 @@ import html
 import time
 import requests
 import yfinance as yf
-from datetime import datetime, timedelta
+import pandas as pd
+from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
 import xml.etree.ElementTree as ETXML
@@ -42,12 +43,26 @@ STATE_FILE = "bot_state.json"
 
 VIX_TICKER = "^VIX"
 SP_TICKER = "^GSPC"
+SPY_TICKER = "SPY"
+QQQ_TICKER = "QQQ"
 OIL_TICKER = "CL=F"
 BOND_TICKER = "^TNX"
+HYG_TICKER = "HYG"
+IEF_TICKER = "IEF"
 
 BTC_TICKER = "BTC-USD"
 ETH_TICKER = "ETH-USD"
 XRP_TICKER = "XRP-USD"
+
+AI_BASKET = {
+    "NVDA": "NVDA",
+    "AMD": "AMD",
+    "AVGO": "AVGO",
+    "TSM": "TSM",
+    "MSFT": "MSFT",
+    "META": "META",
+    "GOOGL": "GOOGL",
+}
 
 # =============================
 # YOUR WATCHLIST
@@ -90,9 +105,9 @@ KOREA_MARKETS = {
     "KOSDAQ": "^KQ11",
 }
 
-# Fallback aliases when Yahoo is flaky for a symbol
+# Fallback aliases when Yahoo is flaky
 TICKER_ALIASES = {
-    "998405.T": ["^TOPX"],  # TOPIX primary + fallback
+    "998405.T": ["^TOPX"],  # TOPIX fallback
 }
 
 # =============================
@@ -113,8 +128,18 @@ state = {
 }
 
 # =============================
-# STATE HELPERS
+# HELPERS
 # =============================
+
+def clamp_score(value, low=0, high=100):
+    return max(low, min(high, int(round(value))))
+
+def score_band(score):
+    if score >= 65:
+        return "HIGH"
+    if score >= 35:
+        return "MEDIUM"
+    return "LOW"
 
 def load_state():
     global state
@@ -133,14 +158,6 @@ def save_state():
             json.dump(state, f, indent=2)
     except Exception as e:
         print("State save error:", e)
-
-def parse_iso_datetime(value):
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except Exception:
-        return None
 
 # =============================
 # TELEGRAM
@@ -239,15 +256,6 @@ def safe_request(url, params=None, headers=None):
 # SESSION LOGIC
 # =============================
 
-def is_us_cash_market_open(now_et):
-    if now_et.weekday() >= 5:
-        return False
-
-    mins = now_et.hour * 60 + now_et.minute
-    open_mins = 9 * 60 + 30
-    close_mins = 16 * 60
-    return open_mins <= mins < close_mins
-
 def in_us_open_alert_window(now_et):
     if now_et.weekday() >= 5:
         return False
@@ -258,19 +266,17 @@ def in_us_open_alert_window(now_et):
     return start <= mins < end
 
 def is_us_futures_open(now_et):
-    wd = now_et.weekday()  # Mon=0 ... Sun=6
+    wd = now_et.weekday()
     mins = now_et.hour * 60 + now_et.minute
 
     if wd == 5:  # Saturday
         return False
-
     if wd == 6:  # Sunday
         return mins >= 18 * 60
-
     if wd == 4:  # Friday
         return mins < 17 * 60
 
-    # Monday-Thursday: open except daily maintenance 5pm-6pm ET
+    # Monday-Thursday maintenance break 5pm-6pm ET
     if 17 * 60 <= mins < 18 * 60:
         return False
 
@@ -435,7 +441,6 @@ def _get_from_info(asset, ticker):
     return None
 
 def _get_from_history(asset, ticker):
-    # Try multiple windows because some symbols are weird on Yahoo
     history_attempts = [
         {"period": "5d", "interval": "1d"},
         {"period": "1mo", "interval": "1d"},
@@ -457,7 +462,6 @@ def _get_from_history(asset, ticker):
                 pct_change = ((latest - prev) / prev) * 100
                 return latest, pct_change
 
-            # If only one close exists, try to pair it with previousClose from info
             if len(closes) == 1:
                 latest = float(closes.iloc[-1])
                 try:
@@ -502,6 +506,108 @@ def get_last_price_and_change(ticker):
 
     raise last_error if last_error else ValueError(f"Failed to fetch quote for {ticker}")
 
+def get_indicator_snapshot(ticker, period="1y"):
+    tickers_to_try = [ticker] + TICKER_ALIASES.get(ticker, [])
+    last_error = None
+
+    for candidate in tickers_to_try:
+        try:
+            asset = yf.Ticker(candidate)
+            hist = asset.history(period=period, interval="1d", auto_adjust=False)
+            closes = hist["Close"].dropna()
+
+            if len(closes) < 50:
+                raise ValueError(f"Not enough indicator history for {candidate}")
+
+            current = float(closes.iloc[-1])
+            sma50 = float(closes.tail(min(50, len(closes))).mean())
+            sma200 = float(closes.tail(min(200, len(closes))).mean())
+            peak = float(closes.max())
+            drawdown = (current - peak) / peak * 100
+            pct_to_200 = ((current / sma200) - 1.0) * 100 if sma200 else 0.0
+
+            return {
+                "ticker_used": candidate,
+                "current": current,
+                "sma50": sma50,
+                "sma200": sma200,
+                "drawdown": drawdown,
+                "below50": current < sma50,
+                "below200": current < sma200,
+                "pct_to_200": pct_to_200,
+            }
+        except Exception as e:
+            last_error = e
+            print(f"Indicator snapshot failed for {ticker} via {candidate}: {e}")
+
+    raise last_error if last_error else ValueError(f"Failed indicator snapshot for {ticker}")
+
+def get_ratio_snapshot(numerator_ticker, denominator_ticker, period="1y"):
+    num = yf.Ticker(numerator_ticker).history(period=period, interval="1d", auto_adjust=False)
+    den = yf.Ticker(denominator_ticker).history(period=period, interval="1d", auto_adjust=False)
+
+    if "Close" not in num.columns or "Close" not in den.columns:
+        raise ValueError("Missing Close column for ratio snapshot")
+
+    df = pd.DataFrame({
+        "num": num["Close"],
+        "den": den["Close"],
+    }).dropna()
+
+    if len(df) < 50:
+        raise ValueError("Not enough ratio history")
+
+    ratio = df["num"] / df["den"]
+    current = float(ratio.iloc[-1])
+    sma50 = float(ratio.tail(min(50, len(ratio))).mean())
+    sma200 = float(ratio.tail(min(200, len(ratio))).mean())
+    peak = float(ratio.max())
+    drawdown = (current - peak) / peak * 100
+    pct_to_200 = ((current / sma200) - 1.0) * 100 if sma200 else 0.0
+
+    return {
+        "current": current,
+        "sma50": sma50,
+        "sma200": sma200,
+        "drawdown": drawdown,
+        "below50": current < sma50,
+        "below200": current < sma200,
+        "pct_to_200": pct_to_200,
+    }
+
+def get_ai_basket_snapshot():
+    snapshots = {}
+    for name, ticker in AI_BASKET.items():
+        try:
+            snapshots[name] = get_indicator_snapshot(ticker)
+        except Exception as e:
+            print(f"AI basket member failed for {ticker}: {e}")
+
+    if not snapshots:
+        return {
+            "count": 0,
+            "below50_pct": 0.0,
+            "below200_pct": 0.0,
+            "avg_drawdown": 0.0,
+            "avg_pct_to_200": 0.0,
+            "members": {},
+        }
+
+    count = len(snapshots)
+    below50_pct = sum(1 for s in snapshots.values() if s["below50"]) / count
+    below200_pct = sum(1 for s in snapshots.values() if s["below200"]) / count
+    avg_drawdown = sum(s["drawdown"] for s in snapshots.values()) / count
+    avg_pct_to_200 = sum(s["pct_to_200"] for s in snapshots.values()) / count
+
+    return {
+        "count": count,
+        "below50_pct": below50_pct,
+        "below200_pct": below200_pct,
+        "avg_drawdown": avg_drawdown,
+        "avg_pct_to_200": avg_pct_to_200,
+        "members": snapshots,
+    }
+
 def get_market_data():
     vix_price, vix_change = get_last_price_and_change(VIX_TICKER)
 
@@ -530,6 +636,12 @@ def get_market_data():
 
     crypto_fg = get_crypto_fear_greed()
 
+    spy_snapshot = get_indicator_snapshot(SPY_TICKER)
+    qqq_snapshot = get_indicator_snapshot(QQQ_TICKER)
+    hyg_snapshot = get_indicator_snapshot(HYG_TICKER)
+    credit_proxy = get_ratio_snapshot(HYG_TICKER, IEF_TICKER)
+    ai_basket = get_ai_basket_snapshot()
+
     return {
         "vix_price": vix_price,
         "vix_change": vix_change,
@@ -540,7 +652,322 @@ def get_market_data():
         "sma200": sma200,
         "stock_fear_greed": stock_fg,
         "crypto_fear_greed": crypto_fg,
+        "spy_snapshot": spy_snapshot,
+        "qqq_snapshot": qqq_snapshot,
+        "hyg_snapshot": hyg_snapshot,
+        "credit_proxy": credit_proxy,
+        "ai_basket": ai_basket,
     }
+
+# =============================
+# SCORE BREAKDOWNS
+# =============================
+
+def get_market_risk_breakdown(data):
+    score = 0
+    lines = []
+
+    vix = data["vix_price"]
+    if vix >= 40:
+        pts = 25
+    elif vix >= 35:
+        pts = 22
+    elif vix >= 30:
+        pts = 18
+    elif vix >= 25:
+        pts = 14
+    elif vix >= 20:
+        pts = 8
+    elif vix >= 16:
+        pts = 3
+    else:
+        pts = 0
+    score += pts
+    lines.append(f"VIX stress: +{pts}/25")
+
+    dd = data["drawdown"]
+    if dd <= -20:
+        pts = 15
+    elif dd <= -15:
+        pts = 13
+    elif dd <= -10:
+        pts = 10
+    elif dd <= -6:
+        pts = 7
+    elif dd <= -3:
+        pts = 4
+    else:
+        pts = 0
+    score += pts
+    lines.append(f"S&P drawdown stress: +{pts}/15")
+
+    stock_fg = data.get("stock_fear_greed")
+    fg = stock_fg["value"] if stock_fg else None
+    if fg is None:
+        pts = 7
+    elif fg <= 20:
+        pts = 15
+    elif fg <= 30:
+        pts = 12
+    elif fg <= 40:
+        pts = 9
+    elif fg <= 50:
+        pts = 5
+    elif fg <= 60:
+        pts = 2
+    else:
+        pts = 0
+    score += pts
+    lines.append(f"Fear & Greed stress: +{pts}/15")
+
+    spy = data["spy_snapshot"]
+    qqq = data["qqq_snapshot"]
+    pts = 0
+    if spy["below50"]:
+        pts += 3
+    if spy["below200"]:
+        pts += 4
+    if qqq["below50"]:
+        pts += 3
+    if qqq["below200"]:
+        pts += 5
+    pts = min(15, pts)
+    score += pts
+    lines.append(f"SPY / QQQ trend damage: +{pts}/15")
+
+    credit = data["credit_proxy"]
+    hyg = data["hyg_snapshot"]
+    pts = 0
+    if hyg["below50"]:
+        pts += 3
+    if hyg["below200"]:
+        pts += 4
+    if credit["below50"]:
+        pts += 3
+    if credit["below200"]:
+        pts += 4
+    if credit["pct_to_200"] <= -3:
+        pts += 1
+    pts = min(15, pts)
+    score += pts
+    lines.append(f"Credit proxy stress (HYG / IEF): +{pts}/15")
+
+    ai = data["ai_basket"]
+    pts = 0
+    if ai["count"] == 0:
+        pts = 5
+    else:
+        if ai["below200_pct"] >= 0.75:
+            pts += 8
+        elif ai["below200_pct"] >= 0.50:
+            pts += 6
+        elif ai["below200_pct"] >= 0.25:
+            pts += 3
+
+        if ai["avg_drawdown"] <= -25:
+            pts += 7
+        elif ai["avg_drawdown"] <= -15:
+            pts += 5
+        elif ai["avg_drawdown"] <= -8:
+            pts += 3
+    pts = min(15, pts)
+    score += pts
+    lines.append(f"AI basket stress: +{pts}/15")
+
+    return clamp_score(score), lines
+
+def get_buy_opportunity_breakdown(data):
+    raw = 0
+    penalty = 0
+    lines = []
+
+    vix = data["vix_price"]
+    if vix >= 40:
+        pts = 16
+    elif vix >= 35:
+        pts = 14
+    elif vix >= 30:
+        pts = 12
+    elif vix >= 25:
+        pts = 9
+    elif vix >= 20:
+        pts = 5
+    else:
+        pts = 0
+    raw += pts
+    lines.append(f"VIX dislocation: +{pts}/16")
+
+    dd = data["drawdown"]
+    if dd <= -20:
+        pts = 22
+    elif dd <= -15:
+        pts = 19
+    elif dd <= -10:
+        pts = 15
+    elif dd <= -6:
+        pts = 10
+    elif dd <= -3:
+        pts = 5
+    else:
+        pts = 0
+    raw += pts
+    lines.append(f"S&P drawdown reset: +{pts}/22")
+
+    stock_fg = data.get("stock_fear_greed")
+    fg = stock_fg["value"] if stock_fg else None
+    if fg is None:
+        pts = 8
+    elif fg <= 15:
+        pts = 22
+    elif fg <= 25:
+        pts = 18
+    elif fg <= 35:
+        pts = 14
+    elif fg <= 45:
+        pts = 8
+    else:
+        pts = 0
+    raw += pts
+    lines.append(f"Panic / fear setup: +{pts}/22")
+
+    spy = data["spy_snapshot"]
+    qqq = data["qqq_snapshot"]
+    pts = 0
+    if spy["below200"]:
+        pts += 5
+    elif spy["below50"]:
+        pts += 2
+
+    if qqq["below200"]:
+        pts += 7
+    elif qqq["below50"]:
+        pts += 3
+
+    if qqq["drawdown"] <= -12:
+        pts += 2
+
+    pts = min(14, pts)
+    raw += pts
+    lines.append(f"SPY / QQQ technical reset: +{pts}/14")
+
+    ai = data["ai_basket"]
+    pts = 0
+    if ai["count"] > 0:
+        if ai["avg_drawdown"] <= -30:
+            pts += 10
+        elif ai["avg_drawdown"] <= -20:
+            pts += 8
+        elif ai["avg_drawdown"] <= -12:
+            pts += 5
+
+        if ai["below200_pct"] >= 0.75:
+            pts += 8
+        elif ai["below200_pct"] >= 0.50:
+            pts += 6
+        elif ai["below200_pct"] >= 0.25:
+            pts += 3
+    pts = min(18, pts)
+    raw += pts
+    lines.append(f"AI basket reset: +{pts}/18")
+
+    credit = data["credit_proxy"]
+    hyg = data["hyg_snapshot"]
+
+    # Moderate credit stress can support buy-opportunity,
+    # but severe credit deterioration gets penalized later.
+    pts = 0
+    if credit["below200"]:
+        pts += 3
+    if credit["pct_to_200"] <= -1.5:
+        pts += 2
+    if hyg["below200"]:
+        pts += 3
+    pts = min(8, pts)
+    raw += pts
+    lines.append(f"Moderate credit stress: +{pts}/8")
+
+    # Penalty for severe credit deterioration / deeper systemic stress
+    if credit["pct_to_200"] <= -6:
+        penalty += 8
+    elif credit["pct_to_200"] <= -4:
+        penalty += 5
+    elif credit["pct_to_200"] <= -3:
+        penalty += 3
+
+    if hyg["drawdown"] <= -12:
+        penalty += 4
+    elif hyg["drawdown"] <= -8:
+        penalty += 2
+
+    if vix >= 45 and dd <= -20:
+        penalty += 4
+
+    penalty = min(12, penalty)
+    lines.append(f"Crash / credit penalty: -{penalty}/12")
+
+    final_score = clamp_score(raw - penalty)
+    return final_score, lines
+
+def get_market_risk_score(data):
+    score, _ = get_market_risk_breakdown(data)
+    return score
+
+def get_buy_opportunity_score(data):
+    score, _ = get_buy_opportunity_breakdown(data)
+    return score
+
+def format_signal_scores(data):
+    risk_score, risk_lines = get_market_risk_breakdown(data)
+    buy_score, buy_lines = get_buy_opportunity_breakdown(data)
+
+    lines = [
+        "📐 Market Scores",
+        f"Risk Level: {score_band(risk_score)} ({risk_score}/100)",
+        f"Buy Opportunity: {score_band(buy_score)} ({buy_score}/100)",
+        "",
+        "Risk Score Breakdown",
+        *[f"• {line}" for line in risk_lines],
+        "",
+        "Buy Opportunity Breakdown",
+        *[f"• {line}" for line in buy_lines],
+        "",
+        "How to read it:",
+        "• Higher risk = market conditions are more stressed",
+        "• Higher buy opportunity = better phased long-term contrarian setup",
+        "• Buy opportunity is not a short-term price forecast",
+    ]
+    return "\n".join(lines)
+
+def format_score_method():
+    return "\n".join([
+        "🧠 Score Method",
+        "",
+        "Risk Score (0-100) adds:",
+        "• VIX stress: max 25",
+        "• S&P drawdown from 1Y high: max 15",
+        "• Stock Fear & Greed stress: max 15",
+        "• SPY / QQQ trend damage: max 15",
+        "• Credit proxy stress (HYG / IEF + HYG trend): max 15",
+        "• AI basket stress: max 15",
+        "",
+        "Buy Opportunity Score (0-100) adds:",
+        "• VIX dislocation: max 16",
+        "• S&P drawdown reset: max 22",
+        "• Panic / fear setup: max 22",
+        "• SPY / QQQ technical reset: max 14",
+        "• AI basket reset: max 18",
+        "• Moderate credit stress: max 8",
+        "",
+        "Then subtracts:",
+        "• Crash / credit penalty: up to 12",
+        "",
+        "Key difference:",
+        "• Risk asks: how dangerous / stressed is the market?",
+        "• Buy Opportunity asks: how attractive is this for gradual long-term buying?",
+        "",
+        "Credit proxy note:",
+        "• This uses HYG / IEF as a proxy for credit stress because it is easier to pull reliably from market data feeds than raw option-adjusted spreads.",
+    ])
 
 # =============================
 # FORMATTERS
@@ -593,6 +1020,9 @@ def format_asia_markets():
     return "\n".join(lines)
 
 def format_market_snapshot(data):
+    risk_score = get_market_risk_score(data)
+    buy_score = get_buy_opportunity_score(data)
+
     lines = [
         "📊 Market Snapshot",
         "",
@@ -600,6 +1030,8 @@ def format_market_snapshot(data):
         f"S&P 500: {data['sp_current']:.2f}",
         f"Drawdown from 1Y peak: {data['drawdown']:.2f}%",
         f"Regime: {detect_market_regime(data)}",
+        f"Risk Level: {score_band(risk_score)} ({risk_score}/100)",
+        f"Buy Opportunity: {score_band(buy_score)} ({buy_score}/100)",
     ]
 
     stock_fg = data.get("stock_fear_greed")
@@ -620,7 +1052,6 @@ def format_market_snapshot(data):
 
 def build_combined_market_update(title, data):
     lines = [title, ""]
-
     lines.append(format_market_snapshot(data))
     lines.append("")
     lines.append(format_futures())
@@ -648,34 +1079,29 @@ def build_asia_open_update():
 # =============================
 
 def detect_market_regime(data):
-    vix = data["vix_price"]
-    drawdown = data["drawdown"]
-    fg = None
+    risk_score = get_market_risk_score(data)
 
-    stock_fg = data.get("stock_fear_greed")
-    if stock_fg:
-        fg = stock_fg["value"]
-
-    if vix >= 35 and drawdown <= -12:
+    if risk_score >= 80 and data["drawdown"] <= -10:
         return "CRISIS"
-
-    if vix >= 27 or (fg is not None and fg < 30):
+    if risk_score >= 60:
         return "RISK OFF"
-
-    if vix < 18 and (fg is not None and fg > 60):
+    if risk_score <= 30 and data["vix_price"] < 18:
         return "RISK ON"
-
     return "NEUTRAL"
 
 def maybe_send_regime_alert(data):
     regime = detect_market_regime(data)
+    risk_score = get_market_risk_score(data)
+    buy_score = get_buy_opportunity_score(data)
 
     if regime != state.get("last_regime"):
         msg = (
             "🌎 MARKET REGIME SHIFT\n\n"
             f"Regime: {regime}\n"
             f"VIX: {data['vix_price']:.2f}\n"
-            f"Drawdown: {data['drawdown']:.2f}%"
+            f"Drawdown: {data['drawdown']:.2f}%\n"
+            f"Risk Level: {score_band(risk_score)} ({risk_score}/100)\n"
+            f"Buy Opportunity: {score_band(buy_score)} ({buy_score}/100)"
         )
 
         stock_fg = data.get("stock_fear_greed")
@@ -717,11 +1143,16 @@ def maybe_send_panic_alert(data):
                 if stock_fg else "N/A"
             )
 
+            risk_score = get_market_risk_score(data)
+            buy_score = get_buy_opportunity_score(data)
+
             msg = (
                 "🚨 STOCK PANIC ALERT 🚨\n\n"
                 f"VIX: {data['vix_price']:.2f}\n"
                 f"Stock Fear & Greed: {fg_text}\n"
-                f"Drawdown: {data['drawdown']:.2f}%"
+                f"Drawdown: {data['drawdown']:.2f}%\n"
+                f"Risk Level: {score_band(risk_score)} ({risk_score}/100)\n"
+                f"Buy Opportunity: {score_band(buy_score)} ({buy_score}/100)"
             )
 
             if send_telegram_message(msg):
@@ -733,12 +1164,14 @@ def maybe_send_panic_alert(data):
 # =============================
 
 def check_buy_zone(data):
-    active = data["drawdown"] < -6 and data["vix_price"] > 25
+    buy_score = get_buy_opportunity_score(data)
+    active = buy_score >= 65
     was_active = bool(state.get("last_buy_zone_active", False))
 
     if active and not was_active:
         msg = (
             "🟢 BUY ZONE DETECTED\n\n"
+            f"Buy Opportunity: {score_band(buy_score)} ({buy_score}/100)\n"
             f"Drawdown: {data['drawdown']:.2f}%\n"
             f"VIX: {data['vix_price']:.2f}"
         )
@@ -887,6 +1320,8 @@ def get_newsletter_sections():
 
 def build_newsletter():
     data = get_market_data()
+    risk_score = get_market_risk_score(data)
+    buy_score = get_buy_opportunity_score(data)
 
     lines = []
     now_asia = datetime.now(ASIA_TZ).strftime("%Y-%m-%d %H:%M")
@@ -898,6 +1333,8 @@ def build_newsletter():
     lines.append(f"S&P 500: {data['sp_current']:.2f}")
     lines.append(f"Drawdown: {data['drawdown']:.2f}%")
     lines.append(f"Regime: {detect_market_regime(data)}")
+    lines.append(f"Risk Level: {score_band(risk_score)} ({risk_score}/100)")
+    lines.append(f"Buy Opportunity: {score_band(buy_score)} ({buy_score}/100)")
 
     stock_fg = data.get("stock_fear_greed")
     if stock_fg:
@@ -1008,6 +1445,8 @@ def handle_command(text):
             return (
                 "📘 Commands\n\n"
                 "/price - market snapshot\n"
+                "/score - score + breakdown\n"
+                "/scoremethod - explain score formula\n"
                 "/portfolio - your ticker watchlist\n"
                 "/quote NVDA - quote any ticker\n"
                 "/crypto - BTC / ETH / XRP\n"
@@ -1015,7 +1454,7 @@ def handle_command(text):
                 "/vix - VIX check\n"
                 "/oil - oil price\n"
                 "/bond - 10Y yield\n"
-                "/regime - market regime\n"
+                "/regime - market regime explanation\n"
                 "/panic - panic signal status\n"
                 "/sentiment - stock + crypto fear/greed\n"
                 "/japan - Nikkei + TOPIX\n"
@@ -1031,6 +1470,13 @@ def handle_command(text):
         if cmd == "/price":
             data = get_market_data()
             return format_market_snapshot(data)
+
+        if cmd == "/score":
+            data = get_market_data()
+            return format_signal_scores(data)
+
+        if cmd == "/scoremethod":
+            return format_score_method()
 
         if cmd == "/portfolio":
             return format_portfolio_watchlist()
@@ -1058,7 +1504,15 @@ def handle_command(text):
 
         if cmd == "/regime":
             data = get_market_data()
-            return f"🌎 Regime: {detect_market_regime(data)}\n\n{format_market_snapshot(data)}"
+            regime = detect_market_regime(data)
+            return (
+                f"🌎 Regime: {regime}\n\n"
+                "RISK OFF = stressed / defensive market\n"
+                "NEUTRAL = mixed conditions\n"
+                "RISK ON = calmer / supportive market\n"
+                "CRISIS = extreme stress\n\n"
+                + format_market_snapshot(data)
+            )
 
         if cmd == "/panic":
             data = get_market_data()
