@@ -54,6 +54,10 @@ BTC_TICKER = "BTC-USD"
 ETH_TICKER = "ETH-USD"
 XRP_TICKER = "XRP-USD"
 
+TOPIX_TICKER = "998405.T"
+TOPIX_QUOTE_URL = "https://finance.yahoo.co.jp/quote/998405.T"
+TOPIX_HISTORY_URL = "https://finance.yahoo.co.jp/quote/998405.T/history"
+
 AI_BASKET = {
     "NVDA": "NVDA",
     "AMD": "AMD",
@@ -97,7 +101,7 @@ FUTURES_WATCHLIST = {
 
 JAPAN_MARKETS = {
     "Nikkei 225": "^N225",
-    "TOPIX": "998405.T",
+    "TOPIX": TOPIX_TICKER,
 }
 
 KOREA_MARKETS = {
@@ -105,7 +109,6 @@ KOREA_MARKETS = {
     "KOSDAQ": "^KQ11",
 }
 
-# Keep aliases empty for TOPIX to avoid bad fallback to ^TOPX
 TICKER_ALIASES = {}
 
 # =============================
@@ -156,6 +159,14 @@ def save_state():
             json.dump(state, f, indent=2)
     except Exception as e:
         print("State save error:", e)
+
+def _strip_html_text(page):
+    page = re.sub(r"<script.*?</script>", " ", page, flags=re.S | re.I)
+    page = re.sub(r"<style.*?</style>", " ", page, flags=re.S | re.I)
+    page = re.sub(r"<[^>]+>", " ", page)
+    page = html.unescape(page)
+    page = re.sub(r"\s+", " ", page).strip()
+    return page
 
 # =============================
 # TELEGRAM
@@ -240,9 +251,16 @@ def bootstrap_telegram_offset():
 # =============================
 
 def safe_request(url, params=None, headers=None):
+    merged_headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    }
+    if headers:
+        merged_headers.update(headers)
+
     for _ in range(3):
         try:
-            r = requests.get(url, params=params, headers=headers, timeout=20)
+            r = requests.get(url, params=params, headers=merged_headers, timeout=20)
             r.raise_for_status()
             return r
         except Exception as e:
@@ -312,16 +330,8 @@ def get_crypto_fear_greed():
 
 def get_stock_fear_greed():
     try:
-        r = safe_request(
-            "https://feargreedmeter.com/",
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        page = r.text
-        text = re.sub(r"<script.*?</script>", " ", page, flags=re.S | re.I)
-        text = re.sub(r"<style.*?</style>", " ", text, flags=re.S | re.I)
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = html.unescape(text)
-        text = re.sub(r"\s+", " ", text).strip()
+        r = safe_request("https://feargreedmeter.com/")
+        text = _strip_html_text(r.text)
 
         m = re.search(r"Now\s+([A-Za-z ]+?)\s+(\d{1,3})\s+Yesterday", text, flags=re.I)
         if m:
@@ -422,6 +432,50 @@ def _get_close_series(df):
         return pd.Series(dtype="float64")
     return pd.to_numeric(df["Close"], errors="coerce").dropna()
 
+def get_topix_quote():
+    # First try quote page: current + daily pct
+    try:
+        r = safe_request(TOPIX_QUOTE_URL)
+        text = _strip_html_text(r.text)
+
+        m = re.search(
+            r"TOPIX\s+998405\.T\s+([\d,]+\.\d+)\s+前日比\s+([+\-]?\d[\d,]*\.\d+)\(([+\-]?\d+(?:\.\d+)?)%\)",
+            text
+        )
+        if m:
+            current = float(m.group(1).replace(",", ""))
+            pct = float(m.group(3))
+            return current, pct
+
+        m_current = re.search(r"TOPIX\s+998405\.T\s+([\d,]+\.\d+)\s+前日比", text)
+        m_prev = re.search(r"前日終値\s+([\d,]+\.\d+)\(", text)
+        if m_current and m_prev:
+            current = float(m_current.group(1).replace(",", ""))
+            prev_close = float(m_prev.group(1).replace(",", ""))
+            return _calc_pct(current, prev_close)
+    except Exception as e:
+        print("TOPIX quote-page scrape failed:", e)
+
+    # Fallback: use history page closes
+    try:
+        r = safe_request(TOPIX_HISTORY_URL)
+        text = _strip_html_text(r.text)
+
+        closes = re.findall(
+            r"20\d{2}年\d{1,2}月\d{1,2}日\s+[\d,]+\.\d+\s+[\d,]+\.\d+\s+[\d,]+\.\d+\s+([\d,]+\.\d+)",
+            text
+        )
+        closes = [float(x.replace(",", "")) for x in closes]
+
+        if len(closes) >= 2:
+            latest = closes[0]
+            prev = closes[1]
+            return _calc_pct(latest, prev)
+    except Exception as e:
+        print("TOPIX history-page scrape failed:", e)
+
+    raise ValueError("Failed to fetch TOPIX from Yahoo Japan")
+
 def _get_from_fast_info(asset, ticker):
     try:
         fi = asset.fast_info
@@ -513,6 +567,9 @@ def _get_from_history(asset, ticker):
     return latest, pct_change
 
 def _get_quote_single(ticker):
+    if ticker == TOPIX_TICKER:
+        return get_topix_quote()
+
     asset = yf.Ticker(ticker)
 
     result = _get_from_fast_info(asset, ticker)
@@ -526,6 +583,9 @@ def _get_quote_single(ticker):
     return _get_from_history(asset, ticker)
 
 def get_last_price_and_change(ticker):
+    if ticker == TOPIX_TICKER:
+        return get_topix_quote()
+
     tickers_to_try = [ticker] + TICKER_ALIASES.get(ticker, [])
     last_error = None
 
@@ -1318,7 +1378,7 @@ def fetch_google_news_rss(query, top_n=2):
             "https://news.google.com/rss/search?"
             f"q={quote(query)}&hl=en-US&gl=US&ceid=US:en"
         )
-        r = safe_request(url, headers={"User-Agent": "Mozilla/5.0"})
+        r = safe_request(url)
         root = ETXML.fromstring(r.content)
 
         items = []
