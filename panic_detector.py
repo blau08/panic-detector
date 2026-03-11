@@ -105,10 +105,8 @@ KOREA_MARKETS = {
     "KOSDAQ": "^KQ11",
 }
 
-# Fallback aliases when Yahoo is flaky
-TICKER_ALIASES = {
-    "998405.T": ["^TOPX"],  # TOPIX fallback
-}
+# Keep aliases empty for TOPIX to avoid bad fallback to ^TOPX
+TICKER_ALIASES = {}
 
 # =============================
 # STATE
@@ -269,14 +267,13 @@ def is_us_futures_open(now_et):
     wd = now_et.weekday()
     mins = now_et.hour * 60 + now_et.minute
 
-    if wd == 5:  # Saturday
+    if wd == 5:
         return False
-    if wd == 6:  # Sunday
+    if wd == 6:
         return mins >= 18 * 60
-    if wd == 4:  # Friday
+    if wd == 4:
         return mins < 17 * 60
 
-    # Monday-Thursday maintenance break 5pm-6pm ET
     if 17 * 60 <= mins < 18 * 60:
         return False
 
@@ -410,6 +407,21 @@ def _calc_pct(latest, prev_close):
     pct_change = ((latest - prev_close) / prev_close) * 100
     return latest, pct_change
 
+def _normalize_df(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    return df
+
+def _get_close_series(df):
+    df = _normalize_df(df)
+    if df.empty or "Close" not in df.columns:
+        return pd.Series(dtype="float64")
+    return pd.to_numeric(df["Close"], errors="coerce").dropna()
+
 def _get_from_fast_info(asset, ticker):
     try:
         fi = asset.fast_info
@@ -440,45 +452,65 @@ def _get_from_info(asset, ticker):
         print(f"info fallback failed for {ticker}:", e)
     return None
 
-def _get_from_history(asset, ticker):
-    history_attempts = [
-        {"period": "5d", "interval": "1d"},
+def _history_attempts():
+    return [
+        {"period": "7d", "interval": "1d"},
         {"period": "1mo", "interval": "1d"},
         {"period": "3mo", "interval": "1d"},
+        {"period": "6mo", "interval": "1d"},
+        {"period": "1y", "interval": "1d"},
     ]
 
-    for attempt in history_attempts:
-        try:
-            hist = asset.history(
-                period=attempt["period"],
-                interval=attempt["interval"],
-                auto_adjust=False
-            )
-            closes = hist["Close"].dropna()
+def _download_history(ticker, period, interval):
+    try:
+        df = yf.download(
+            ticker,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+        return _normalize_df(df)
+    except Exception as e:
+        print(f"yf.download failed for {ticker} ({period}, {interval}):", e)
+        return pd.DataFrame()
 
-            if len(closes) >= 2:
-                latest = float(closes.iloc[-1])
-                prev = float(closes.iloc[-2])
-                pct_change = ((latest - prev) / prev) * 100
-                return latest, pct_change
+def _ticker_history(asset, ticker, period, interval):
+    try:
+        df = asset.history(
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+        )
+        return _normalize_df(df)
+    except Exception as e:
+        print(f"Ticker.history failed for {ticker} ({period}, {interval}):", e)
+        return pd.DataFrame()
 
-            if len(closes) == 1:
-                latest = float(closes.iloc[-1])
-                try:
-                    info = asset.info or {}
-                    prev_close = (
-                        info.get("regularMarketPreviousClose")
-                        or info.get("previousClose")
-                    )
-                    if prev_close not in (None, 0):
-                        return _calc_pct(latest, prev_close)
-                except Exception as e:
-                    print(f"single-close info fallback failed for {ticker}:", e)
+def _get_best_history(asset, ticker, min_points=2):
+    for attempt in _history_attempts():
+        period = attempt["period"]
+        interval = attempt["interval"]
 
-        except Exception as e:
-            print(f"history fallback failed for {ticker} with {attempt}:", e)
+        df = _ticker_history(asset, ticker, period, interval)
+        closes = _get_close_series(df)
+        if len(closes) >= min_points:
+            return closes
+
+        df = _download_history(ticker, period, interval)
+        closes = _get_close_series(df)
+        if len(closes) >= min_points:
+            return closes
 
     raise ValueError(f"Not enough price history for {ticker}")
+
+def _get_from_history(asset, ticker):
+    closes = _get_best_history(asset, ticker, min_points=2)
+    latest = float(closes.iloc[-1])
+    prev = float(closes.iloc[-2])
+    pct_change = ((latest - prev) / prev) * 100
+    return latest, pct_change
 
 def _get_quote_single(ticker):
     asset = yf.Ticker(ticker)
@@ -513,8 +545,7 @@ def get_indicator_snapshot(ticker, period="1y"):
     for candidate in tickers_to_try:
         try:
             asset = yf.Ticker(candidate)
-            hist = asset.history(period=period, interval="1d", auto_adjust=False)
-            closes = hist["Close"].dropna()
+            closes = _get_best_history(asset, candidate, min_points=50)
 
             if len(closes) < 50:
                 raise ValueError(f"Not enough indicator history for {candidate}")
@@ -543,15 +574,15 @@ def get_indicator_snapshot(ticker, period="1y"):
     raise last_error if last_error else ValueError(f"Failed indicator snapshot for {ticker}")
 
 def get_ratio_snapshot(numerator_ticker, denominator_ticker, period="1y"):
-    num = yf.Ticker(numerator_ticker).history(period=period, interval="1d", auto_adjust=False)
-    den = yf.Ticker(denominator_ticker).history(period=period, interval="1d", auto_adjust=False)
+    num_asset = yf.Ticker(numerator_ticker)
+    den_asset = yf.Ticker(denominator_ticker)
 
-    if "Close" not in num.columns or "Close" not in den.columns:
-        raise ValueError("Missing Close column for ratio snapshot")
+    num_closes = _get_best_history(num_asset, numerator_ticker, min_points=50)
+    den_closes = _get_best_history(den_asset, denominator_ticker, min_points=50)
 
     df = pd.DataFrame({
-        "num": num["Close"],
-        "den": den["Close"],
+        "num": num_closes,
+        "den": den_closes,
     }).dropna()
 
     if len(df) < 50:
@@ -873,8 +904,6 @@ def get_buy_opportunity_breakdown(data):
     credit = data["credit_proxy"]
     hyg = data["hyg_snapshot"]
 
-    # Moderate credit stress can support buy-opportunity,
-    # but severe credit deterioration gets penalized later.
     pts = 0
     if credit["below200"]:
         pts += 3
@@ -886,7 +915,6 @@ def get_buy_opportunity_breakdown(data):
     raw += pts
     lines.append(f"Moderate credit stress: +{pts}/8")
 
-    # Penalty for severe credit deterioration / deeper systemic stress
     if credit["pct_to_200"] <= -6:
         penalty += 8
     elif credit["pct_to_200"] <= -4:
