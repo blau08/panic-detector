@@ -54,9 +54,7 @@ BTC_TICKER = "BTC-USD"
 ETH_TICKER = "ETH-USD"
 XRP_TICKER = "XRP-USD"
 
-TOPIX_TICKER = "998405.T"
-TOPIX_QUOTE_URL = "https://finance.yahoo.co.jp/quote/998405.T"
-TOPIX_HISTORY_URL = "https://finance.yahoo.co.jp/quote/998405.T/history"
+TOPIX_PROXY_TICKER = "1306.T"
 
 AI_BASKET = {
     "NVDA": "NVDA",
@@ -101,7 +99,7 @@ FUTURES_WATCHLIST = {
 
 JAPAN_MARKETS = {
     "Nikkei 225": "^N225",
-    "TOPIX": TOPIX_TICKER,
+    "TOPIX Proxy": TOPIX_PROXY_TICKER,
 }
 
 KOREA_MARKETS = {
@@ -253,7 +251,6 @@ def bootstrap_telegram_offset():
 def safe_request(url, params=None, headers=None):
     merged_headers = {
         "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
     }
     if headers:
         merged_headers.update(headers)
@@ -432,50 +429,6 @@ def _get_close_series(df):
         return pd.Series(dtype="float64")
     return pd.to_numeric(df["Close"], errors="coerce").dropna()
 
-def get_topix_quote():
-    # First try quote page: current + daily pct
-    try:
-        r = safe_request(TOPIX_QUOTE_URL)
-        text = _strip_html_text(r.text)
-
-        m = re.search(
-            r"TOPIX\s+998405\.T\s+([\d,]+\.\d+)\s+前日比\s+([+\-]?\d[\d,]*\.\d+)\(([+\-]?\d+(?:\.\d+)?)%\)",
-            text
-        )
-        if m:
-            current = float(m.group(1).replace(",", ""))
-            pct = float(m.group(3))
-            return current, pct
-
-        m_current = re.search(r"TOPIX\s+998405\.T\s+([\d,]+\.\d+)\s+前日比", text)
-        m_prev = re.search(r"前日終値\s+([\d,]+\.\d+)\(", text)
-        if m_current and m_prev:
-            current = float(m_current.group(1).replace(",", ""))
-            prev_close = float(m_prev.group(1).replace(",", ""))
-            return _calc_pct(current, prev_close)
-    except Exception as e:
-        print("TOPIX quote-page scrape failed:", e)
-
-    # Fallback: use history page closes
-    try:
-        r = safe_request(TOPIX_HISTORY_URL)
-        text = _strip_html_text(r.text)
-
-        closes = re.findall(
-            r"20\d{2}年\d{1,2}月\d{1,2}日\s+[\d,]+\.\d+\s+[\d,]+\.\d+\s+[\d,]+\.\d+\s+([\d,]+\.\d+)",
-            text
-        )
-        closes = [float(x.replace(",", "")) for x in closes]
-
-        if len(closes) >= 2:
-            latest = closes[0]
-            prev = closes[1]
-            return _calc_pct(latest, prev)
-    except Exception as e:
-        print("TOPIX history-page scrape failed:", e)
-
-    raise ValueError("Failed to fetch TOPIX from Yahoo Japan")
-
 def _get_from_fast_info(asset, ticker):
     try:
         fi = asset.fast_info
@@ -567,9 +520,6 @@ def _get_from_history(asset, ticker):
     return latest, pct_change
 
 def _get_quote_single(ticker):
-    if ticker == TOPIX_TICKER:
-        return get_topix_quote()
-
     asset = yf.Ticker(ticker)
 
     result = _get_from_fast_info(asset, ticker)
@@ -583,9 +533,6 @@ def _get_quote_single(ticker):
     return _get_from_history(asset, ticker)
 
 def get_last_price_and_change(ticker):
-    if ticker == TOPIX_TICKER:
-        return get_topix_quote()
-
     tickers_to_try = [ticker] + TICKER_ALIASES.get(ticker, [])
     last_error = None
 
@@ -1545,7 +1492,7 @@ def handle_command(text):
                 "/regime - market regime explanation\n"
                 "/panic - panic signal status\n"
                 "/sentiment - stock + crypto fear/greed\n"
-                "/japan - Nikkei + TOPIX\n"
+                "/japan - Nikkei + TOPIX proxy\n"
                 "/korea - KOSPI + KOSDAQ\n"
                 "/asia - Japan + Korea snapshot\n"
                 "/asiaopenupdate - send Asia open snapshot now\n"
